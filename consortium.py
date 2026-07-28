@@ -327,6 +327,7 @@ class Consortium:
         self.quotas: dict[str, int] = {aid: max_messages for aid, _ in agents}
         self.passed: set[str] = set()
         self.active: set[str] = set()
+        self.last_said: dict[str, str | None] = {aid: None for aid, _ in agents}  # Track each agent's last message
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -376,19 +377,30 @@ class Consortium:
     def first_prompt(self, aid: str) -> str:
         name = self.name(aid)
         return (
-            f"You are {name} in a group discussion (consortium) with: {self.all_names(aid)}.\n\n"
+            f"You are {name} participating in a group discussion (consortium) with: {self.all_names(aid)}.\n\n"
             f"Topic: {self.topic}\n\n"
-            f"You have {self.max_messages} messages maximum.\n"
-            f"When others speak, you'll see '[Name]: message'.\n"
-            f"Respond with your contribution, or exactly 'PASS' if you have nothing to add.\n"
-            f"Passing is fine — you stay in the conversation.\n\n"
-            f"The discussion starts now.\n[{self.initiator}]: {self.topic}"
+            f"This is your first opportunity to speak in this consortium. The discussion is just beginning.\n"
+            f"You have {self.max_messages} messages maximum. Use them wisely.\n\n"
+            f"Rules:\n"
+            f"- When others speak, you'll see their messages as '[Name]: their message'\n"
+            f"- If you have something to add, write your response\n"
+            f"- If you don't have anything to add, respond with exactly: PASS\n"
+            f"- Passing is fine — you stay in the conversation and can speak later\n"
+            f"- Your response will be shared with all other agents\n\n"
+            f"Opening topic from {self.initiator}:\n{self.topic}"
         )
 
     def update_prompt(self, aid: str, msgs: list[ConsortiumMessage]) -> str:
         lines = "\n".join(m.format() for m in msgs)
-        return (f"{lines}\n\nRespond with your message, or PASS.\n"
-                f"You have {self.quotas[aid]}/{self.max_messages} remaining.")
+        last = self.last_said.get(aid)
+        last_context = f"Your last message was: \"{last}\"\n\n" if last else ""
+        return (
+            f"{last_context}"
+            f"New messages since you last spoke:\n{lines}\n\n"
+            f"Your message was received by all agents. Do you want to respond to any of the above?\n"
+            f"Write your response, or PASS.\n"
+            f"You have {self.quotas[aid]}/{self.max_messages} remaining."
+        )
 
     def reprompt(self, aid: str, draft: str, msgs: list[ConsortiumMessage]) -> str:
         new = "\n".join(m.format() for m in msgs)
