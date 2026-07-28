@@ -392,21 +392,38 @@ class Consortium:
 
     def update_prompt(self, aid: str, msgs: list[ConsortiumMessage]) -> str:
         lines = "\n".join(m.format() for m in msgs)
-        last = self.last_said.get(aid)
-        last_context = f"Your last message was: \"{last}\"\n\n" if last else ""
+        remaining = self.quotas[aid]
+        
+        # Build context about what the agent did last
+        if self.last_said.get(aid):
+            # Agent spoke previously and it was delivered
+            last_context = f"Your last message was delivered to the group: \"{self.last_said[aid]}\"\n\n"
+        elif aid in self.passed:
+            # Agent passed previously
+            last_context = "You passed in the previous round.\n\n"
+        else:
+            # First time seeing new messages (was idle/waiting)
+            last_context = ""
+        
         return (
             f"{last_context}"
-            f"New messages since you last spoke:\n{lines}\n\n"
-            f"Your message was received by all agents. Do you want to respond to any of the above?\n"
-            f"Write your response, or PASS.\n"
-            f"You have {self.quotas[aid]}/{self.max_messages} remaining."
+            f"New messages from the group:\n{lines}\n\n"
+            f"Do you want to respond to any of the above?\n"
+            f"Write your response, or PASS if you have nothing to add.\n"
+            f"You have {remaining}/{self.max_messages} remaining."
         )
 
     def reprompt(self, aid: str, draft: str, msgs: list[ConsortiumMessage]) -> str:
         new = "\n".join(m.format() for m in msgs)
-        return (f"While you were composing, new messages arrived:\n\n{new}\n\n"
-                f'Your draft was: "{draft}"\n\n'
-                f"Revise, keep as-is, or PASS. {self.quotas[aid]}/{self.max_messages} remaining.")
+        return (
+            f"IMPORTANT: Your previous response was NOT delivered to the group yet.\n"
+            f"While you were composing your response, other agents sent new messages.\n\n"
+            f"Messages you missed:\n{new}\n\n"
+            f'Your undelivered response was: "{draft}"\n\n"
+            f"You must resend your response for it to be shared with the group.\n"
+            f"You can resend it as-is, revise it to incorporate the new messages above, or PASS.\n"
+            f"Send your final response now, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
+        )
 
     async def agent_loop(self, aid: str):
         """Process one message cycle for an agent. Called once per cycle by the main loop."""
