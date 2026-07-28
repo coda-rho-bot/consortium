@@ -364,9 +364,11 @@ class Consortium:
     async def broadcast(self, sender_id: str, text: str, msg_type: str = "message"):
         msg = ConsortiumMessage(self.name(sender_id), text, msg_type)
         self.transcript.append(msg)
-        for aid in self.queues:
-            if aid != sender_id:
-                await self.queues[aid].put(msg)
+        # Only queue for other agents if it's a real message (not a pass)
+        if msg_type == "message":
+            for aid in self.queues:
+                if aid != sender_id:
+                    await self.queues[aid].put(msg)
         display = text if msg_type == "message" else f"({text})"
         sender_name = self.name(sender_id) if sender_id else "System"
         self.log(f"**[{sender_name}]** {display}")
@@ -411,7 +413,7 @@ class Consortium:
             while not self.queues[aid].empty():
                 new_msgs.append(self.queues[aid].get_nowait())
         except asyncio.TimeoutError:
-            return  # No new messages this cycle
+            return  # No new messages this cycle — silent (not a PASS, just nothing to react to)
 
         # Build prompt
         prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
@@ -442,6 +444,7 @@ class Consortium:
         except asyncio.TimeoutError:
             self.log(f"  {name} timed out — PASS")
             self.passed.add(aid)
+            await self.broadcast(aid, "(timed out)", "pass")
             return
         except ACPError as e:
             self.log(f"  {name} error: {e}")
@@ -450,10 +453,34 @@ class Consortium:
 
         response = response.strip()
 
-        if response.upper() == "PASS" or not response:
+        if not response or response.strip().upper() == "PASS":
+            # Clean PASS — agent has nothing to add
             self.passed.add(aid)
             self.log(f"  {name}: PASS")
+            await self.broadcast(aid, "explicitly passed", "pass")
             return
+        
+        # Check if response ends with PASS (agent said something then passed)
+        if response.rstrip().endswith("PASS.") or response.rstrip().endswith("PASS"):
+            # Extract the message part before PASS
+            pass_idx = response.upper().rfind("PASS")
+            actual_message = response[:pass_idx].strip().rstrip(".")
+            if actual_message:
+                # Agent had something to say AND passed — post the message
+                self.quotas[aid] -= 1
+                self.passed.discard(aid)
+                await self.broadcast(aid, actual_message)
+                self.passed.add(aid)
+                self.log(f"  {name}: (spoke then PASS)")
+                await self.broadcast(aid, "said their piece, then passed", "pass")
+                if self.quotas[aid] <= 0:
+                    self.active.discard(aid)
+                return
+            else:
+                self.passed.add(aid)
+                self.log(f"  {name}: PASS")
+                await self.broadcast(aid, "explicitly passed", "pass")
+                return
 
         # Submit with lock — check for context changes
         async with self.lock:
@@ -473,7 +500,8 @@ class Consortium:
                 except (asyncio.TimeoutError, ACPError):
                     pass  # Keep original
 
-            if response.upper() == "PASS" or not response:
+            if not response or response.strip().upper() == "PASS" or response.strip().endswith("PASS."):
+            # Agent explicitly passed
                 self.passed.add(aid)
                 return
 
@@ -533,8 +561,10 @@ class Consortium:
             if self.ending:
                 break
 
+            self.log(f"--- Cycle {cycle + 1} ---")
+            self.transcript.append(ConsortiumMessage("System", f"--- Cycle {cycle + 1} ---", "system"))
+
             # Each agent processes ONE message cycle (wait for msg, respond, return)
-            # This lets us check termination between cycles
             tasks = [asyncio.create_task(self.agent_loop(aid)) for aid in list(self.active)]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -583,6 +613,8 @@ class Consortium:
         for msg in self.transcript:
             if msg.type == "system":
                 lines.append(f"*{msg.text}*")
+            elif msg.type == "pass":
+                lines.append(f"**[{msg.sender}]** *(PASS — {msg.text})*")
             else:
                 lines.append(f"**[{msg.sender}]** {msg.text}")
             lines.append("")
