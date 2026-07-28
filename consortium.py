@@ -422,7 +422,7 @@ class Consortium:
             f'Your undelivered response was: "{draft}"\n\n'
             f"You must resend your response for it to be shared with the group.\n"
             f"You can resend it as-is, revise it to incorporate the new messages above, or PASS.\n"
-            f"Send your final response now, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
+            f"Consider further based on the new messages, or send your updated response, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
         )
 
     async def agent_loop(self, aid: str):
