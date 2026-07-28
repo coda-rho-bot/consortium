@@ -395,93 +395,95 @@ class Consortium:
                 f"Revise, keep as-is, or PASS. {self.quotas[aid]}/{self.max_messages} remaining.")
 
     async def agent_loop(self, aid: str):
-        """Main loop for one agent."""
+        """Process one message cycle for an agent. Called once per cycle by the main loop."""
         name = self.name(aid)
         agent = self.acp_agents.get(aid)
-        if not agent:
+        if not agent or aid not in self.active or self.ending:
             return
 
-        first = True
+        first = not hasattr(agent, '_consortium_started')
 
-        while aid in self.active and not self.ending:
-            # Collect new messages
-            new_msgs = []
-            try:
-                first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=1.0)
-                new_msgs.append(first_msg)
-                while not self.queues[aid].empty():
-                    new_msgs.append(self.queues[aid].get_nowait())
-            except asyncio.TimeoutError:
-                continue
+        # Collect new messages from queue
+        new_msgs = []
+        try:
+            first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=2.0)
+            new_msgs.append(first_msg)
+            while not self.queues[aid].empty():
+                new_msgs.append(self.queues[aid].get_nowait())
+        except asyncio.TimeoutError:
+            return  # No new messages this cycle
 
-            prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
-            first = False
+        # Build prompt
+        prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
+        if first:
+            agent._consortium_started = True
 
-            self.log(f"*{name} is thinking...*")
+        self.log(f"*{name} is thinking...*")
 
-            # Stream thinking to console
-            async def on_event(event):
-                kind = event.get("kind", "")
-                if kind == "agent_thought_chunk":
-                    thinking = event.get("thinking", "")
-                    sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
-                    sys.stdout.flush()
-                elif kind == "agent_message_chunk":
-                    sys.stdout.write("\r" + " " * 100 + "\r")
-                    sys.stdout.flush()
-
-            try:
-                response = await asyncio.wait_for(
-                    agent.prompt(prompt, on_event=on_event),
-                    timeout=self.prompt_timeout
-                )
+        # Stream thinking to console
+        async def on_event(event):
+            kind = event.get("kind", "")
+            if kind == "agent_thought_chunk":
+                thinking = event.get("thinking", "")
+                sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
+                sys.stdout.flush()
+            elif kind == "agent_message_chunk":
                 sys.stdout.write("\r" + " " * 100 + "\r")
                 sys.stdout.flush()
-            except asyncio.TimeoutError:
-                self.log(f"  {name} timed out — PASS")
-                self.passed.add(aid)
-                continue
-            except ACPError as e:
-                self.log(f"  {name} error: {e}")
-                self.passed.add(aid)
-                continue
 
-            response = response.strip()
+        # Call agent
+        try:
+            response = await asyncio.wait_for(
+                agent.prompt(prompt, on_event=on_event),
+                timeout=self.prompt_timeout
+            )
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            sys.stdout.flush()
+        except asyncio.TimeoutError:
+            self.log(f"  {name} timed out — PASS")
+            self.passed.add(aid)
+            return
+        except ACPError as e:
+            self.log(f"  {name} error: {e}")
+            self.passed.add(aid)
+            return
+
+        response = response.strip()
+
+        if response.upper() == "PASS" or not response:
+            self.passed.add(aid)
+            self.log(f"  {name}: PASS")
+            return
+
+        # Submit with lock — check for context changes
+        async with self.lock:
+            missed = []
+            while not self.queues[aid].empty():
+                missed.append(self.queues[aid].get_nowait())
+
+            if missed:
+                self.log(f"  {name}: context changed, re-prompting...")
+                try:
+                    revised = await asyncio.wait_for(
+                        agent.prompt(self.reprompt(aid, response, missed)),
+                        timeout=self.prompt_timeout
+                    )
+                    if revised.strip() and revised.strip().upper() != "PASS":
+                        response = revised.strip()
+                except (asyncio.TimeoutError, ACPError):
+                    pass  # Keep original
 
             if response.upper() == "PASS" or not response:
                 self.passed.add(aid)
-                self.log(f"  {name}: PASS")
-                continue
+                return
 
-            # Submit with lock — check for context changes
-            async with self.lock:
-                missed = []
-                while not self.queues[aid].empty():
-                    missed.append(self.queues[aid].get_nowait())
+            self.quotas[aid] -= 1
+            self.passed.discard(aid)
+            await self.broadcast(aid, response)
 
-                if missed:
-                    self.log(f"  {name}: context changed, re-prompting...")
-                    try:
-                        revised = await asyncio.wait_for(
-                            agent.prompt(self.reprompt(aid, response, missed)),
-                            timeout=self.prompt_timeout
-                        )
-                        if revised.strip() and revised.strip().upper() != "PASS":
-                            response = revised.strip()
-                    except (asyncio.TimeoutError, ACPError):
-                        pass  # Keep original
-
-                if response.upper() == "PASS" or not response:
-                    self.passed.add(aid)
-                    continue
-
-                self.quotas[aid] -= 1
-                self.passed.discard(aid)
-                await self.broadcast(aid, response)
-
-                if self.quotas[aid] <= 0:
-                    self.log(f"  {name} is out of messages")
-                    self.active.discard(aid)
+            if self.quotas[aid] <= 0:
+                self.log(f"  {name} is out of messages")
+                self.active.discard(aid)
 
     async def human_loop(self):
         if not self.interactive:
@@ -531,18 +533,26 @@ class Consortium:
             if self.ending:
                 break
 
+            # Each agent processes ONE message cycle (wait for msg, respond, return)
+            # This lets us check termination between cycles
             tasks = [asyncio.create_task(self.agent_loop(aid)) for aid in list(self.active)]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+            # Clear passed set for next cycle — agents can speak again if new msgs arrive
+            self.passed.clear()
+
             if self.should_end():
                 break
-
-            if self.active.issubset(self.passed):
-                await asyncio.sleep(0.5)
-                if not any(not self.queues[aid].empty() for aid in self.active):
+            
+            # Check if there are any pending messages for any active agent
+            if not any(not self.queues[aid].empty() for aid in self.active):
+                # No pending messages and all agents returned — check if anyone wants to speak
+                # by looking at whether any agent still has quota
+                if not any(self.quotas[aid] > 0 for aid in self.active):
                     break
-                self.passed.clear()
+                # Agents have quota but no messages queued — conversation has stalled
+                break
 
         self.ending = True
         human_task.cancel()
