@@ -419,7 +419,7 @@ class Consortium:
             f"IMPORTANT: Your previous response was NOT delivered to the group yet.\n"
             f"While you were composing your response, other agents sent new messages.\n\n"
             f"Messages you missed:\n{new}\n\n"
-            f'Your undelivered response was: "{draft}"\n\n"
+            f'Your undelivered response was: "{draft}"\n\n'
             f"You must resend your response for it to be shared with the group.\n"
             f"You can resend it as-is, revise it to incorporate the new messages above, or PASS.\n"
             f"Send your final response now, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
