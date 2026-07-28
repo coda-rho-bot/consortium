@@ -616,6 +616,9 @@ class Consortium:
         self.ending = True
         human_task.cancel()
 
+        # Reflection phase: give each agent the full transcript to process
+        await self.reflection_phase()
+
         for agent in self.acp_agents.values():
             await agent.stop()
 
@@ -623,6 +626,61 @@ class Consortium:
         msg_count = sum(1 for m in self.transcript if m.type == "message")
         self.log(f"\nConsortium ended. {msg_count} messages.")
         self.log(f"Transcript: {self.transcript_path}")
+
+    async def reflection_phase(self):
+        """Give each agent the full transcript to reflect on, update memory, run tools, etc."""
+        self.log("\n--- Reflection Phase ---")
+        
+        # Build a readable transcript for the agents
+        transcript_lines = []
+        for msg in self.transcript:
+            if msg.type == "system":
+                continue  # Skip cycle markers
+            elif msg.type == "pass":
+                transcript_lines.append(f"[{msg.sender}]: (PASS)")
+            else:
+                transcript_lines.append(f"[{msg.sender}]: {msg.text}")
+        full_transcript = "\n".join(transcript_lines)
+        
+        participants = ", ".join(self.name(aid) for aid, _ in self.agents)
+        
+        reflection_prompt = (
+            f"The consortium has ended. Here is the full conversation:\n\n"
+            f"{full_transcript}\n\n"
+            f"Participants: {participants}\n"
+            f"Total messages: {sum(1 for m in self.transcript if m.type == 'message')}\n\n"
+            f"Take a moment to reflect on this discussion. You can:\n"
+            f"- Update your memory with anything important that was discussed\n"
+            f"- Note any decisions, action items, or follow-ups for yourself\n"
+            f"- Run any tools or commands you need to (Bash, file writes, etc.)\n\n"
+            f"There is no need to respond to the group. This is your personal reflection time.\n"
+            f"Simply acknowledge when you're done (one sentence)."
+        )
+        
+        # Run reflections concurrently
+        tasks = []
+        for aid, agent in self.acp_agents.items():
+            name = self.name(aid)
+            tasks.append(self._reflect(aid, agent, name, reflection_prompt))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        self.log("--- Reflection complete ---")
+
+    async def _reflect(self, aid: str, agent, name: str, prompt: str):
+        """Run reflection for a single agent."""
+        self.log(f"*{name} is reflecting...*")
+        try:
+            response = await asyncio.wait_for(
+                agent.prompt(prompt),
+                timeout=120.0
+            )
+            self.log(f"  {name} done reflecting")
+        except asyncio.TimeoutError:
+            self.log(f"  {name} reflection timed out")
+        except Exception as e:
+            self.log(f"  {name} reflection error: {e}")
 
     def save_transcript(self):
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
