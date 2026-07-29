@@ -1,0 +1,62 @@
+# Agent config for Consortium
+# This file defines which agents participate in consortium discussions.
+# Copy this to agents.yaml and customize for your setup.
+
+agents:
+  # Example: Letta Code agent (via letta-acp)
+  # The optional `model` field names the model to use.
+  # `model_env` specifies which env var to inject with the model value.
+  # For letta-acp, the env var is LETTA_ACP_MODEL.
+  - id: alice
+    name: Alice
+    command: letta-acp
+    args: ["--yolo"]
+    model: glm
+    model_env: LETTA_ACP_MODEL
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-xxxx
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:XXXXX
+      # letta-acp may need this for WebSocket support:
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/user
+
+  # Example: agent using a different model
+  - id: bob
+    name: Bob
+    command: letta-acp
+    args: ["--yolo"]
+    model: gpt-4o
+    model_env: LETTA_ACP_MODEL
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-yyyy
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:YYYYY
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/user
+
+  # Example: Claude Code agent (model via command args, no model_env needed)
+  # - id: claude
+  #   name: Claude
+  #   command: claude
+  #   args: ["--model", "claude-sonnet-4-5-20250929"]
+  #   env: {}
+  #   cwd: /home/user
+
+  # Example: Copilot CLI agent
+  # - id: copilot
+  #   name: Copilot
+  #   command: copilot.exe
+  #   args: ["--yolo"]
+  #   env: {}
+  #   cwd: /home/user
+
+  # Example: any ACP-compatible agent with custom model env var
+  # - id: custom
+  #   name: Custom
+  #   command: my-acp-agent
+  #   args: []
+  #   model: my-model-name
+  #   model_env: MY_AGENT_MODEL
+  #   env: {}
+  #   cwd: /home/user
