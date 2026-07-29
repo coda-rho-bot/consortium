@@ -47,6 +47,7 @@ agents:
     name: Alice
     command: letta-acp
     args: ["--yolo"]
+    model: glm          # optional: model override (passed as LETTA_ACP_MODEL)
     env:
       LETTA_ACP_BACKEND: remote
       LETTA_AGENT_ID: agent-xxxx
@@ -57,6 +58,7 @@ agents:
     name: Bob
     command: claude
     args: []
+    model: gpt-4o       # different model per agent
     env: {}
     cwd: /home/user
 ```
@@ -65,9 +67,10 @@ agents:
 
 **Inline** (no config file):
 ```bash
+# name:command or name:model:command
 python3 consortium.py \
     --topic "..." \
-    --agent "alice:letta-acp --yolo" \
+    --agent "alice:glm:letta-acp --yolo" \
     --agent "bob:claude"
 ```
 
@@ -87,7 +90,7 @@ python3 consortium.py \
 |------|-------------|---------|
 | `--topic` | Discussion topic (required) | — |
 | `--config` | Agent config file (YAML/JSON) | — |
-| `--agent` | Agent in `name:command` format (repeatable) | — |
+| `--agent` | Agent in `name:command` or `name:model:command` format (repeatable) | — |
 | `--max-messages` | Max messages per agent | 5 |
 | `--initiator` | Who started the discussion | Human |
 | `--interactive` | Human can type messages during discussion | false |
