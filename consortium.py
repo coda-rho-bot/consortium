@@ -712,7 +712,8 @@ class Consortium:
             f"- When others speak, you'll see their messages as '[Name]: their message'\n"
             f"- If you have something to add, write your response\n"
             f"- If you don't have anything to add, respond with exactly: PASS\n"
-            f"- Passing is fine — you stay in the conversation and can speak later\n"
+            f"- Passing is fine — you stay in the conversation and will be prompted again when new messages arrive\n"
+            f"- You don't need to do anything after passing — just wait\n"
             f"- Your response will be shared with all other agents\n\n"
             f"Opening topic from {self.initiator}:\n{self.topic}"
         )
@@ -800,6 +801,8 @@ class Consortium:
 
             current_prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
             current_draft = None  # The agent's composed response
+            recompose_count = 0  # Limit re-compose iterations (prevent livelock)
+            MAX_RECOMPOSE = 5   # After this, broadcast what we have
 
             while True:
                 if first:
@@ -859,13 +862,21 @@ class Consortium:
                 while not self.queues[aid].empty():
                     missed.append(self.queues[aid].get_nowait())
 
-                if missed:
+                if missed and recompose_count < MAX_RECOMPOSE:
                     # Messages arrived during composition. Block the broadcast.
                     # Tell the agent what they missed and have them re-compose.
-                    self.log(f"  {name}: {len(missed)} new message(s) arrived during composition — re-composing")
+                    recompose_count += 1
+                    self.log(f"  {name}: {len(missed)} new message(s) arrived during composition — re-composing ({recompose_count}/{MAX_RECOMPOSE})")
                     current_draft = response
                     current_prompt = self.reprompt(aid, current_draft, missed)
                     continue  # Loop back to compose with the new context
+                elif missed:
+                    # Hit re-compose limit — broadcast what we have
+                    self.log(f"  {name}: re-compose limit reached — broadcasting with best effort")
+                    # Drain remaining messages so they're not lost
+                    while not self.queues[aid].empty():
+                        self.queues[aid].get_nowait()
+                    current_draft = response
                 else:
                     # No new messages — safe to broadcast
                     current_draft = response
