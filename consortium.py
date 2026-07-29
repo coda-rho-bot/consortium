@@ -638,8 +638,7 @@ class Consortium:
 
         self.acp_agents: dict[str, ACPAgent] = {}
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
-        self.quotas: dict[str, int] = {aid: config.get("max_messages", max_messages) for aid, config in
-                                       [(c["id"], c) for c in agent_configs]}
+        self.quotas: dict[str, int] = {c["id"]: c.get("max_messages", max_messages) for c in agent_configs}
         self.initial_quotas: dict[str, int] = dict(self.quotas)  # For display
         self.passed: set[str] = set()
         self.active: set[str] = set()
@@ -781,8 +780,7 @@ class Consortium:
                     queue_wait = self.idle_timeout
                 first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=queue_wait)
                 new_msgs.append(first_msg)
-                # Drain any additional messages that arrived
-                await asyncio.sleep(0.1)  # Brief pause to let concurrent broadcasts settle
+                # Drain any additional messages that arrived (Design #8: no sleep, drain immediately)
                 while not self.queues[aid].empty():
                     new_msgs.append(self.queues[aid].get_nowait())
             except asyncio.TimeoutError:
@@ -828,9 +826,10 @@ class Consortium:
                         sys.stdout.flush()
 
                 try:
+                    # Design #11: single timeout — prompt() handles its own internal deadline
                     response = await asyncio.wait_for(
                         agent.prompt(current_prompt, on_event=on_event, timeout=self.prompt_timeout),
-                        timeout=self.prompt_timeout
+                        timeout=self.prompt_timeout + 5  # Outer timeout slightly longer than inner
                     )
                     sys.stdout.write("\r" + " " * 100 + "\r")
                     sys.stdout.flush()
@@ -914,11 +913,16 @@ class Consortium:
                 continue
 
             # Regular message — broadcast (already verified no missed messages)
+            # Design #10: re-composes consume quota since they cost real LLM calls
             actual_response = message if message else response
-            self.quotas[aid] -= 1
+            # First compose costs 1 quota. Each re-compose costs 1 additional.
+            total_cost = 1 + recompose_count
+            self.quotas[aid] -= total_cost
             self.passed.discard(aid)
             await self.broadcast(aid, actual_response)
             self.last_said[aid] = actual_response
+            if recompose_count > 0:
+                self.log(f"  {name}: broadcast after {recompose_count} re-compose(s) (quota cost: {total_cost})")
 
             if self.quotas[aid] <= 0:
                 self.log(f"  {name} is out of messages")
