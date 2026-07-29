@@ -7,6 +7,10 @@ Each agent is spawned as an ACP-compatible subprocess, communicating via
 JSON-RPC 2.0 over stdio. Agent-agnostic — works with ANY ACP-compatible agent
 (letta-acp, Claude Code, Copilot CLI, or any tool implementing the ACP spec).
 
+Event-driven architecture: each agent runs as an independent task. Messages
+flow immediately as they're produced — fast agents speak again without waiting
+for slow ones. The conversation ends naturally after a period of silence.
+
 Usage:
     # With a config file (recommended):
     python3 consortium.py \
@@ -618,7 +622,8 @@ class Consortium:
     def __init__(self, topic: str, agent_configs: list[dict],
                  max_messages: int = 5, initiator: str = "Human",
                  interactive: bool = False, prompt_timeout: int = 300,
-                 unsafe: bool = False, max_cycles: int = 100):  # M11
+                 unsafe: bool = False, max_cycles: int = 100,
+                 idle_timeout: int = 30):  # Event-driven: seconds of silence before ending
         self.topic = topic
         self.agent_configs = agent_configs
         self.max_messages = max_messages
@@ -626,7 +631,8 @@ class Consortium:
         self.interactive = interactive
         self.prompt_timeout = prompt_timeout
         self.unsafe = unsafe  # C3
-        self.max_cycles = max_cycles  # M11
+        self.max_cycles = max_cycles  # M11: kept as safety valve
+        self.idle_timeout = idle_timeout
 
         self.agents = [(c["id"], c.get("name", c["id"])) for c in agent_configs]
 
@@ -638,6 +644,7 @@ class Consortium:
         self.prev_passed: set[str] = set()  # M8: snapshot for update_prompt context
         self.active: set[str] = set()
         self.last_said: dict[str, str | None] = {aid: None for aid, _ in self.agents}
+        self._composing: set[str] = set()  # Track which agents are currently composing
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -645,6 +652,7 @@ class Consortium:
         self.transcript_path: Path | None = None
         self._started_agents: set[str] = set()  # L7: replace monkey-patching
         self._start_time: datetime | None = None  # L2: capture actual start time
+        self._last_activity: float = 0.0  # Event-driven: track last message time
 
     def name(self, aid: str) -> str:
         for agent_id, name in self.agents:
@@ -683,6 +691,7 @@ class Consortium:
     async def broadcast(self, sender_id: str, text: str, msg_type: str = "message"):
         msg = ConsortiumMessage(self.name(sender_id), text, msg_type)
         self.transcript.append(msg)
+        self._last_activity = time.time()  # Event-driven: track activity
         if msg_type == "message":
             # L10: iterate active agents only
             for aid in list(self.active):
@@ -739,136 +748,158 @@ class Consortium:
             f"Consider further based on the new messages, or send your updated response, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
         )
 
-    async def agent_loop(self, aid: str):
-        """Process one message cycle for an agent."""
+    async def agent_run(self, aid: str):
+        """Event-driven agent task — runs continuously, processes messages as they arrive.
+
+        Unlike the old batch-cycle model, each agent runs independently:
+        - Waits for messages in its queue
+        - When messages arrive, composes a response
+        - Broadcasts response immediately to all other agents
+        - Goes back to waiting — no cycle boundary, no waiting for other agents
+        """
         name = self.name(aid)
         agent = self.acp_agents.get(aid)
-        if not agent or aid not in self.active or self.ending:
+        if not agent:
             return
 
-        first = aid not in self._started_agents  # L7
+        while not self.ending:
+            if aid not in self.active or self.quotas.get(aid, 0) <= 0:
+                break
 
-        new_msgs = []
-        try:
-            first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=2.0)
-            new_msgs.append(first_msg)
-            while not self.queues[aid].empty():
-                new_msgs.append(self.queues[aid].get_nowait())
-        except asyncio.TimeoutError:
-            return
+            # Wait for messages — use longer timeout since there's no cycle pressure
+            new_msgs = []
+            try:
+                first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=self.idle_timeout)
+                new_msgs.append(first_msg)
+                # Drain any additional messages that arrived
+                await asyncio.sleep(0.1)  # Brief pause to let concurrent broadcasts settle
+                while not self.queues[aid].empty():
+                    new_msgs.append(self.queues[aid].get_nowait())
+            except asyncio.TimeoutError:
+                # No messages for idle_timeout seconds — agent is idle
+                break
 
-        prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
-        if first:
-            self._started_agents.add(aid)
+            if self.ending:
+                break
 
-        self.log(f"*{name} is thinking...*")
+            first = aid not in self._started_agents
+            prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
+            if first:
+                self._started_agents.add(aid)
 
-        async def on_event(event):
-            kind = event.get("kind", "")
-            if kind in ("agent_thought_chunk", "agent_thought"):
-                thinking = event.get("thinking", "")
-                sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
-                sys.stdout.flush()
-            elif kind in ("agent_message_chunk", "agent_message"):
+            self.log(f"*{name} is thinking...*")
+            self._composing.add(aid)
+
+            async def on_event(event):
+                kind = event.get("kind", "")
+                if kind in ("agent_thought_chunk", "agent_thought"):
+                    thinking = event.get("thinking", "")
+                    sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
+                    sys.stdout.flush()
+                elif kind in ("agent_message_chunk", "agent_message"):
+                    sys.stdout.write("\r" + " " * 100 + "\r")
+                    sys.stdout.flush()
+
+            try:
+                response = await asyncio.wait_for(
+                    agent.prompt(prompt, on_event=on_event, timeout=self.prompt_timeout),
+                    timeout=self.prompt_timeout
+                )
                 sys.stdout.write("\r" + " " * 100 + "\r")
                 sys.stdout.flush()
-
-        try:
-            response = await asyncio.wait_for(
-                agent.prompt(prompt, on_event=on_event),
-                timeout=self.prompt_timeout
-            )
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            sys.stdout.flush()
-        except asyncio.TimeoutError:
-            self.log(f"  {name} timed out — PASS")
-            await agent.cancel_session()
-            self.passed.add(aid)
-            await self.broadcast(aid, "(timed out)", "pass")
-            return
-        except ACPError as e:
-            self.log(f"  {name} error: {e}")
-            self.passed.add(aid)
-            self.active.discard(aid)  # M2: dead agent — remove from active
-            return
-
-        response = response.strip()
-
-        # BUG FIX: Treat empty responses as PASS to avoid broadcasting empty messages.
-        # Empty responses provide no value and can cause cascading empty-message cycles.
-        if not response:
-            self.passed.add(aid)
-            self.log(f"  {name}: PASS (empty response)")
-            await self.broadcast(aid, "explicitly passed", "pass")
-            return
-        message, passed = _extract_message_from_pass(response)
-
-        if passed and message is None:
-            self.passed.add(aid)
-            self.log(f"  {name}: PASS")
-            await self.broadcast(aid, "explicitly passed", "pass")
-            return
-
-        if passed and message is not None:
-            self.quotas[aid] -= 1
-            self.passed.discard(aid)
-            await self.broadcast(aid, message)
-            self.last_said[aid] = message  # M1: track what was said
-            self.passed.add(aid)
-            self.log(f"  {name}: (spoke then PASS)")
-            await self.broadcast(aid, "said their piece, then passed", "pass")
-            if self.quotas[aid] <= 0:
+            except asyncio.TimeoutError:
+                self.log(f"  {name} timed out — PASS")
+                await agent.cancel_session()
+                self.passed.add(aid)
+                await self.broadcast(aid, "(timed out)", "pass")
+                self._composing.discard(aid)
+                continue
+            except ACPError as e:
+                self.log(f"  {name} error: {e}")
+                self.passed.add(aid)
                 self.active.discard(aid)
-            return
+                self._composing.discard(aid)
+                break
 
-        actual_response = message if message else response
+            self._composing.discard(aid)
+            response = response.strip()
 
-        # C6: Only hold lock for the queue drain, not during re-prompt
-        async with self.lock:
+            # Empty response → PASS
+            if not response:
+                self.passed.add(aid)
+                self.log(f"  {name}: PASS (empty response)")
+                await self.broadcast(aid, "explicitly passed", "pass")
+                continue
+
+            message, passed = _extract_message_from_pass(response)
+
+            if passed and message is None:
+                self.passed.add(aid)
+                self.log(f"  {name}: PASS")
+                await self.broadcast(aid, "explicitly passed", "pass")
+                continue
+
+            if passed and message is not None:
+                # Spoke then PASS
+                self.quotas[aid] -= 1
+                self.passed.discard(aid)
+                await self.broadcast(aid, message)
+                self.last_said[aid] = message
+                self.passed.add(aid)
+                self.log(f"  {name}: (spoke then PASS)")
+                await self.broadcast(aid, "said their piece, then passed", "pass")
+                if self.quotas[aid] <= 0:
+                    self.active.discard(aid)
+                continue
+
+            # Regular message — check for context changes before broadcasting
+            actual_response = message if message else response
+
+            # Re-prompt: did new messages arrive while composing?
             missed = []
             while not self.queues[aid].empty():
                 missed.append(self.queues[aid].get_nowait())
 
-        if missed:
-            self.log(f"  {name}: context changed, re-prompting...")
-            try:
-                revised = await asyncio.wait_for(
-                    agent.prompt(self.reprompt(aid, actual_response, missed)),
-                    timeout=self.prompt_timeout
-                )
-                rev_msg, rev_passed = _extract_message_from_pass(revised)
-                if rev_passed:
-                    # C8: properly handle PASS from re-prompt
-                    if rev_msg:
-                        self.quotas[aid] -= 1
-                        self.passed.discard(aid)
-                        await self.broadcast(aid, rev_msg)
-                        self.last_said[aid] = rev_msg  # M1
-                    self.passed.add(aid)
-                    if not rev_msg:
-                        await self.broadcast(aid, "explicitly passed", "pass")
-                    else:
-                        await self.broadcast(aid, "said their piece, then passed", "pass")
-                    if self.quotas[aid] <= 0:
-                        self.active.discard(aid)
-                    return
-                elif rev_msg:
-                    actual_response = rev_msg
-            except asyncio.TimeoutError:
-                # M3: call cancel_session on re-prompt timeout
-                self.log(f"  {name} re-prompt timed out — using original response")
-                await agent.cancel_session()
-            except ACPError:
-                pass
+            if missed:
+                self.log(f"  {name}: context changed, re-prompting...")
+                try:
+                    revised = await asyncio.wait_for(
+                        agent.prompt(self.reprompt(aid, actual_response, missed),
+                                     timeout=self.prompt_timeout),
+                        timeout=self.prompt_timeout
+                    )
+                    rev_msg, rev_passed = _extract_message_from_pass(revised)
+                    if rev_passed:
+                        if rev_msg:
+                            self.quotas[aid] -= 1
+                            self.passed.discard(aid)
+                            await self.broadcast(aid, rev_msg)
+                            self.last_said[aid] = rev_msg
+                        self.passed.add(aid)
+                        if not rev_msg:
+                            await self.broadcast(aid, "explicitly passed", "pass")
+                        else:
+                            await self.broadcast(aid, "said their piece, then passed", "pass")
+                        if self.quotas[aid] <= 0:
+                            self.active.discard(aid)
+                        continue
+                    elif rev_msg:
+                        actual_response = rev_msg
+                except asyncio.TimeoutError:
+                    self.log(f"  {name} re-prompt timed out — using original response")
+                    await agent.cancel_session()
+                except ACPError:
+                    pass
 
-        self.quotas[aid] -= 1
-        self.passed.discard(aid)
-        await self.broadcast(aid, actual_response)
-        self.last_said[aid] = actual_response  # M1: track what was said
+            # Broadcast the response
+            self.quotas[aid] -= 1
+            self.passed.discard(aid)
+            await self.broadcast(aid, actual_response)
+            self.last_said[aid] = actual_response
 
-        if self.quotas[aid] <= 0:
-            self.log(f"  {name} is out of messages")
-            self.active.discard(aid)
+            if self.quotas[aid] <= 0:
+                self.log(f"  {name} is out of messages")
+                self.active.discard(aid)
 
     async def human_loop(self):
         if not self.interactive:
@@ -903,90 +934,90 @@ class Consortium:
         if not self.active:
             self.log("No agents available. Exiting.")
             return
-        if len(self.active) < 2:  # M4: need at least 2 agents for discussion
+        if len(self.active) < 2:
             self.log("Need at least 2 active agents. Exiting.")
             return
 
         self.log(f"\nStarting consortium: {self.topic}")
-        self._start_time = datetime.now()  # L2: capture actual start
+        self._start_time = datetime.now()
+        self._last_activity = time.time()
         self.log(f"Agents: {', '.join(self.name(aid) for aid, _ in self.agents if aid in self.active)}")
-        self.log(f"Max messages per agent: {self.max_messages}\n")
+        self.log(f"Max messages per agent: {self.max_messages}")
+        self.log(f"Mode: event-driven (idle timeout: {self.idle_timeout}s)\n")
 
-        # H12: Add topic to transcript
+        # Broadcast topic to all agents
         await self.broadcast(self.initiator, self.topic)
 
         human_task = asyncio.create_task(self.human_loop())
 
-        for cycle in range(self.max_cycles):  # M11
-            if self.ending:
+        # Launch each agent as an independent long-running task
+        agent_tasks = {}
+        for aid in list(self.active):
+            agent_tasks[aid] = asyncio.create_task(self.agent_run(aid))
+
+        # Monitor loop — waits for natural conversation end
+        # End conditions:
+        # 1. All agent tasks completed (all agents stopped)
+        # 2. All active agents passed AND idle for idle_timeout seconds
+        # 3. No agents composing AND no pending messages AND idle timeout hit
+        while not self.ending:
+            await asyncio.sleep(1.0)
+
+            # Check if all agent tasks are done
+            all_done = all(task.done() for task in agent_tasks.values())
+            if all_done:
                 break
 
-            self.log(f"--- Cycle {cycle + 1} ---")
-            self.transcript.append(ConsortiumMessage("System", f"--- Cycle {cycle + 1} ---", "system"))
-
-            # C7: capture active list BEFORE creating tasks
-            active_list = list(self.active)
-            tasks = [asyncio.create_task(self.agent_loop(aid)) for aid in active_list]
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        aid = active_list[i] if i < len(active_list) else "?"
-                        self.log(f"  Warning: agent_loop error for {aid}: {result}")
-
+            # Check active agents
             if not self.active:
                 break
 
-            all_passed = self.active.issubset(self.passed)
+            # Check idle timeout
+            idle_seconds = time.time() - self._last_activity
             has_pending = any(not self.queues[aid].empty() for aid in self.active)
-            has_quota = any(self.quotas[aid] > 0 for aid in self.active)
+            anyone_composing = bool(self._composing)
+            all_remaining_passed = self.active.issubset(self.passed)
 
-            # Core end condition: if no agent has pending messages, the
-            # consortium is done. Messages only enter queues via:
-            # 1. Initial topic (consumed in cycle 1)
-            # 2. Broadcast from agents who spoke (queued during this cycle)
-            # 3. Interactive human input (queued by human_loop)
-            #
-            # If has_pending=False after a cycle, no agent broadcast anything
-            # and the topic was already consumed. There is genuinely nothing
-            # for any agent to process next cycle. Ending here is correct
-            # regardless of quota or pass state — an agent with quota but no
-            # messages has nothing to respond to.
-            #
-            # Previous versions checked all_passed, has_quota, any_acted — all
-            # of which had edge cases where the consortium cycled endlessly.
-            if not has_pending:
-                # Log explicit reason and record in transcript
-                if all_passed:
-                    reason = "All agents passed. Discussion complete."
-                elif not has_quota:
-                    reason = "All agents out of messages."
-                else:
-                    reason = "No pending messages. Ending."
-                # Make it clear which agents didn't get to respond
-                for aid in list(self.active):
-                    agent_quota = self.quotas.get(aid, 0)
-                    agent_passed = aid in self.passed
-                    agent_name = self.name(aid)
-                    if agent_quota > 0 and not agent_passed:
-                        self.transcript.append(ConsortiumMessage(
-                            "System", f"{agent_name} did not respond (no message to react to)", "system"))
-                self.log(reason)
-                self.transcript.append(ConsortiumMessage("System", reason, "system"))
-                break
-
-            self.prev_passed = set(self.passed)  # M8: snapshot before clearing
-            self.passed.clear()
-        else:
-            # M11: warn when hitting cycle limit
-            self.log(f"Warning: reached cycle limit ({self.max_cycles}). Ending.")
+            if not has_pending and not anyone_composing:
+                if all_remaining_passed and idle_seconds > self.idle_timeout:
+                    self.log(f"All agents passed and idle for {self.idle_timeout}s. Ending.")
+                    break
+                # If not all passed but nobody has messages and nobody is composing,
+                # give it the idle timeout then end
+                if idle_seconds > self.idle_timeout * 2:
+                    self.log(f"Idle for {int(idle_seconds)}s with no activity. Ending.")
+                    break
 
         self.ending = True
+
+        # Cancel any still-running agent tasks
+        for aid, task in agent_tasks.items():
+            if not task.done():
+                self.log(f"  Waiting for {self.name(aid)} to finish...")
+                try:
+                    await asyncio.wait_for(task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
         human_task.cancel()
         try:
             await human_task
         except asyncio.CancelledError:
             pass
+
+        # Record which agents didn't get to use all their messages
+        for aid in list(self.active):
+            remaining = self.quotas.get(aid, 0)
+            if remaining > 0 and aid not in self.passed:
+                self.transcript.append(ConsortiumMessage(
+                    "System", f"{self.name(aid)} did not respond (conversation ended)", "system"))
+
+        end_reason = "All agents passed." if self.active.issubset(self.passed) else "Conversation concluded."
+        self.transcript.append(ConsortiumMessage("System", end_reason, "system"))
 
         await self.reflection_phase()
 
@@ -1129,7 +1160,9 @@ Examples:
     parser.add_argument("--unsafe", action="store_true",
                         help="Use unrestricted permissions (agents can run any command without approval)")
     parser.add_argument("--max-cycles", type=int, default=100,
-                        help="Maximum number of consortium cycles (default: 100)")
+                        help="Maximum number of consortium cycles (default: 100, safety valve)")
+    parser.add_argument("--idle-timeout", type=int, default=30,
+                        help="Seconds of silence before ending (event-driven mode, default: 30)")
     args = parser.parse_args()
 
     # M5: validate args
@@ -1173,7 +1206,8 @@ Examples:
 
     c = Consortium(args.topic, agent_configs, args.max_messages,
                    args.initiator, args.interactive, args.timeout,
-                   unsafe=args.unsafe, max_cycles=args.max_cycles)
+                   unsafe=args.unsafe, max_cycles=args.max_cycles,
+                   idle_timeout=args.idle_timeout)
     asyncio.run(c.run())
 
 
