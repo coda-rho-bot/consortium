@@ -640,12 +640,11 @@ class Consortium:
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
         self.quotas: dict[str, int] = {aid: config.get("max_messages", max_messages) for aid, config in
                                        [(c["id"], c) for c in agent_configs]}
+        self.initial_quotas: dict[str, int] = dict(self.quotas)  # For display
         self.passed: set[str] = set()
-        self.prev_passed: set[str] = set()  # M8: snapshot for update_prompt context
         self.active: set[str] = set()
         self.last_said: dict[str, str | None] = {aid: None for aid, _ in self.agents}
-        self._composing: set[str] = set()  # LLM call in progress (blocks settling)
-        self._settling: set[str] = set()   # Has response, waiting for others (does NOT block)
+        self._composing: set[str] = set()  # LLM call in progress
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -708,7 +707,7 @@ class Consortium:
             f"You are {name} participating in a group discussion (consortium) with: {self.all_names(aid)}.\n\n"
             f"Topic: {self.topic}\n\n"
             f"This is your first opportunity to speak in this consortium. The discussion is just beginning.\n"
-            f"You have {self.max_messages} messages maximum. Use them wisely.\n\n"
+            f"You have {self.quotas.get(aid, self.max_messages)} messages maximum. Use them wisely.\n\n"
             f"Rules:\n"
             f"- When others speak, you'll see their messages as '[Name]: their message'\n"
             f"- If you have something to add, write your response\n"
@@ -724,7 +723,7 @@ class Consortium:
 
         if self.last_said.get(aid):
             last_context = f'Your last message was delivered to the group: "{self.last_said[aid]}"\n\n'
-        elif aid in self.prev_passed:  # M8: use snapshot from last cycle
+        elif aid in self.passed:
             last_context = "You passed in the previous round.\n\n"
         else:
             last_context = ""
@@ -734,7 +733,7 @@ class Consortium:
             f"New messages from the group:\n{lines}\n\n"
             f"Do you want to respond to any of the above?\n"
             f"Write your response, or PASS if you have nothing to add.\n"
-            f"You have {remaining}/{self.max_messages} remaining."
+            f"You have {remaining}/{self.initial_quotas.get(aid, self.max_messages)} remaining."
         )
 
     def reprompt(self, aid: str, draft: str, msgs: list[ConsortiumMessage]) -> str:
@@ -746,7 +745,7 @@ class Consortium:
             f'Your undelivered response was: "{draft}"\n\n'
             f"You must resend your response for it to be shared with the group.\n"
             f"You can resend it as-is, revise it to incorporate the new messages above, or PASS.\n"
-            f"Consider further based on the new messages, or send your updated response, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
+            f"Consider further based on the new messages, or send your updated response, or PASS. {self.quotas[aid]}/{self.initial_quotas.get(aid, self.max_messages)} remaining."
         )
 
     async def agent_run(self, aid: str):
@@ -770,7 +769,12 @@ class Consortium:
             # Wait for messages — use longer timeout since there's no cycle pressure
             new_msgs = []
             try:
-                first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=self.idle_timeout)
+                # Wait for messages — use a long timeout since other agents
+                # may be composing for up to prompt_timeout seconds.
+                # Critical #4: idle_timeout (30s) is too short if agents
+                # are composing (up to 300s). Use prompt_timeout + buffer.
+                queue_wait = max(self.idle_timeout, self.prompt_timeout + 30)
+                first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=queue_wait)
                 new_msgs.append(first_msg)
                 # Drain any additional messages that arrived
                 await asyncio.sleep(0.1)  # Brief pause to let concurrent broadcasts settle
@@ -922,7 +926,8 @@ class Consortium:
                 if line:
                     msg = ConsortiumMessage("Human", line)
                     self.transcript.append(msg)
-                    for aid in list(self.active):  # L10
+                    self._last_activity = time.time()  # Critical #3: update activity
+                    for aid in list(self.active):
                         await self.queues[aid].put(msg)
                     self.log(f"**[Human]** {line}")
             except asyncio.CancelledError:
@@ -978,7 +983,7 @@ class Consortium:
             # Check idle timeout
             idle_seconds = time.time() - self._last_activity
             has_pending = any(not self.queues[aid].empty() for aid in self.active)
-            anyone_composing = bool(self._composing or self._settling)
+            anyone_composing = bool(self._composing)
             all_remaining_passed = self.active.issubset(self.passed)
 
             if not has_pending and not anyone_composing:
@@ -1177,6 +1182,9 @@ Examples:
         sys.exit(1)
     if args.max_cycles <= 0:
         print("Error: --max-cycles must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.idle_timeout <= 0:
+        print("Error: --idle-timeout must be > 0", file=sys.stderr)
         sys.exit(1)
 
     agent_configs = []
