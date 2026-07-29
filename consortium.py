@@ -644,7 +644,8 @@ class Consortium:
         self.prev_passed: set[str] = set()  # M8: snapshot for update_prompt context
         self.active: set[str] = set()
         self.last_said: dict[str, str | None] = {aid: None for aid, _ in self.agents}
-        self._composing: set[str] = set()  # Track which agents are currently composing
+        self._composing: set[str] = set()  # LLM call in progress (blocks settling)
+        self._settling: set[str] = set()   # Has response, waiting for others (does NOT block)
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -783,54 +784,94 @@ class Consortium:
                 break
 
             first = aid not in self._started_agents
-            prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
-            if first:
-                self._started_agents.add(aid)
+            # ── Compose-Check-Block Loop ──────────────────────────────────
+            # Each time an agent finishes composing, check if new messages
+            # arrived from other agents who broadcast while we were composing.
+            # If yes: block the broadcast, tell the agent what they missed,
+            # and re-compose. Repeat until no new messages arrived during
+            # the compose cycle. Only then broadcast.
+            #
+            # This guarantees: when an agent broadcasts, it has seen ALL
+            # messages that were broadcast before its compose finished.
 
-            self.log(f"*{name} is thinking...*")
-            self._composing.add(aid)
+            current_prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
+            current_draft = None  # The agent's composed response
 
-            async def on_event(event):
-                kind = event.get("kind", "")
-                if kind in ("agent_thought_chunk", "agent_thought"):
-                    thinking = event.get("thinking", "")
-                    sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
-                    sys.stdout.flush()
-                elif kind in ("agent_message_chunk", "agent_message"):
+            while True:
+                if first:
+                    self._started_agents.add(aid)
+                    first = False
+
+                self.log(f"*{name} is thinking...*")
+                self._composing.add(aid)
+
+                async def on_event(event):
+                    kind = event.get("kind", "")
+                    if kind in ("agent_thought_chunk", "agent_thought"):
+                        thinking = event.get("thinking", "")
+                        sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
+                        sys.stdout.flush()
+                    elif kind in ("agent_message_chunk", "agent_message"):
+                        sys.stdout.write("\r" + " " * 100 + "\r")
+                        sys.stdout.flush()
+
+                try:
+                    response = await asyncio.wait_for(
+                        agent.prompt(current_prompt, on_event=on_event, timeout=self.prompt_timeout),
+                        timeout=self.prompt_timeout
+                    )
                     sys.stdout.write("\r" + " " * 100 + "\r")
                     sys.stdout.flush()
+                except asyncio.TimeoutError:
+                    self.log(f"  {name} timed out — PASS")
+                    await agent.cancel_session()
+                    self.passed.add(aid)
+                    self._composing.discard(aid)
+                    await self.broadcast(aid, "(timed out)", "pass")
+                    current_draft = None
+                    break
+                except ACPError as e:
+                    self.log(f"  {name} error: {e}")
+                    self.passed.add(aid)
+                    self.active.discard(aid)
+                    self._composing.discard(aid)
+                    current_draft = None
+                    break
 
-            try:
-                response = await asyncio.wait_for(
-                    agent.prompt(prompt, on_event=on_event, timeout=self.prompt_timeout),
-                    timeout=self.prompt_timeout
-                )
-                sys.stdout.write("\r" + " " * 100 + "\r")
-                sys.stdout.flush()
-            except asyncio.TimeoutError:
-                self.log(f"  {name} timed out — PASS")
-                await agent.cancel_session()
-                self.passed.add(aid)
-                await self.broadcast(aid, "(timed out)", "pass")
+                # LLM response received — no longer composing
                 self._composing.discard(aid)
-                continue
-            except ACPError as e:
-                self.log(f"  {name} error: {e}")
-                self.passed.add(aid)
-                self.active.discard(aid)
-                self._composing.discard(aid)
-                break
+                response = response.strip()
 
-            self._composing.discard(aid)
-            response = response.strip()
+                # Empty response → PASS immediately (no need to check queue)
+                if not response:
+                    self.passed.add(aid)
+                    self.log(f"  {name}: PASS (empty response)")
+                    await self.broadcast(aid, "explicitly passed", "pass")
+                    current_draft = None
+                    break
 
-            # Empty response → PASS
-            if not response:
-                self.passed.add(aid)
-                self.log(f"  {name}: PASS (empty response)")
-                await self.broadcast(aid, "explicitly passed", "pass")
-                continue
+                # Check: did new messages arrive while we were composing?
+                missed = []
+                while not self.queues[aid].empty():
+                    missed.append(self.queues[aid].get_nowait())
 
+                if missed:
+                    # Messages arrived during composition. Block the broadcast.
+                    # Tell the agent what they missed and have them re-compose.
+                    self.log(f"  {name}: {len(missed)} new message(s) arrived during composition — re-composing")
+                    current_draft = response
+                    current_prompt = self.reprompt(aid, current_draft, missed)
+                    continue  # Loop back to compose with the new context
+                else:
+                    # No new messages — safe to broadcast
+                    current_draft = response
+                    break
+
+            # Process the final draft (or None if PASS/error/timeout)
+            if current_draft is None:
+                continue  # Already handled (PASS, timeout, error)
+
+            response = current_draft
             message, passed = _extract_message_from_pass(response)
 
             if passed and message is None:
@@ -852,46 +893,8 @@ class Consortium:
                     self.active.discard(aid)
                 continue
 
-            # Regular message — check for context changes before broadcasting
+            # Regular message — broadcast (already verified no missed messages)
             actual_response = message if message else response
-
-            # Re-prompt: did new messages arrive while composing?
-            missed = []
-            while not self.queues[aid].empty():
-                missed.append(self.queues[aid].get_nowait())
-
-            if missed:
-                self.log(f"  {name}: context changed, re-prompting...")
-                try:
-                    revised = await asyncio.wait_for(
-                        agent.prompt(self.reprompt(aid, actual_response, missed),
-                                     timeout=self.prompt_timeout),
-                        timeout=self.prompt_timeout
-                    )
-                    rev_msg, rev_passed = _extract_message_from_pass(revised)
-                    if rev_passed:
-                        if rev_msg:
-                            self.quotas[aid] -= 1
-                            self.passed.discard(aid)
-                            await self.broadcast(aid, rev_msg)
-                            self.last_said[aid] = rev_msg
-                        self.passed.add(aid)
-                        if not rev_msg:
-                            await self.broadcast(aid, "explicitly passed", "pass")
-                        else:
-                            await self.broadcast(aid, "said their piece, then passed", "pass")
-                        if self.quotas[aid] <= 0:
-                            self.active.discard(aid)
-                        continue
-                    elif rev_msg:
-                        actual_response = rev_msg
-                except asyncio.TimeoutError:
-                    self.log(f"  {name} re-prompt timed out — using original response")
-                    await agent.cancel_session()
-                except ACPError:
-                    pass
-
-            # Broadcast the response
             self.quotas[aid] -= 1
             self.passed.discard(aid)
             await self.broadcast(aid, actual_response)
@@ -975,7 +978,7 @@ class Consortium:
             # Check idle timeout
             idle_seconds = time.time() - self._last_activity
             has_pending = any(not self.queues[aid].empty() for aid in self.active)
-            anyone_composing = bool(self._composing)
+            anyone_composing = bool(self._composing or self._settling)
             all_remaining_passed = self.active.issubset(self.passed)
 
             if not has_pending and not anyone_composing:
