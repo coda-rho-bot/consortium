@@ -632,7 +632,8 @@ class Consortium:
 
         self.acp_agents: dict[str, ACPAgent] = {}
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
-        self.quotas: dict[str, int] = {aid: max_messages for aid, _ in self.agents}
+        self.quotas: dict[str, int] = {aid: config.get("max_messages", max_messages) for aid, config in
+                                       [(c["id"], c) for c in agent_configs]}
         self.passed: set[str] = set()
         self.prev_passed: set[str] = set()  # M8: snapshot for update_prompt context
         self.active: set[str] = set()
