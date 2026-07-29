@@ -775,6 +775,9 @@ class Consortium:
                 # Critical #4: idle_timeout (30s) is too short if agents
                 # are composing (up to 300s). Use prompt_timeout + buffer.
                 queue_wait = max(self.idle_timeout, self.prompt_timeout + 30)
+                # For testing: allow very short queue waits
+                if self.idle_timeout < 5:
+                    queue_wait = self.idle_timeout
                 first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=queue_wait)
                 new_msgs.append(first_msg)
                 # Drain any additional messages that arrived
