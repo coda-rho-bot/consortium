@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Consortium — Multi-agent group chat via Letta CLI.
+Consortium — ACP-native multi-agent group chat.
 
-Agents participate in living conversations: thinking concurrently, speaking
-when they have something to say, reacting to each other in real time.
-
-Uses `letta -p --from-agent` which internally uses ACP.
+Agents participate in living conversations via raw ACP (Agent Client Protocol).
+Each agent is spawned as a letta-acp subprocess, communicating via JSON-RPC 2.0
+over stdio. Agent-agnostic — works with any ACP-compatible agent.
 
 Usage:
     python3 consortium.py \\
@@ -22,10 +21,13 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# ─── Agent Registry ───────────────────────────────────────────────────────────
 
 AGENT_NAMES = {
     "agent-b499137a-e1dd-4427-b9df-73e87adfce9e": "Coda",
@@ -36,9 +38,10 @@ AGENT_NAMES = {
     "agent-8c1f9353-481d-414c-8e35-2da9c16db269": "Linus",
 }
 
+DEFAULT_LETTA_ACP = os.path.expanduser("~/.nvm/versions/node/v22.22.3/bin/letta-acp")
+
 
 def resolve_agent(name_or_id: str) -> tuple[str, str]:
-    """Resolve agent name/short-id to (full_id, display_name)."""
     if name_or_id.startswith("agent-"):
         return name_or_id, AGENT_NAMES.get(name_or_id, name_or_id[:12])
     for aid, name in AGENT_NAMES.items():
@@ -46,6 +49,256 @@ def resolve_agent(name_or_id: str) -> tuple[str, str]:
             return aid, name
     return name_or_id, name_or_id[:12]
 
+
+def load_agent_env(agent_id: str) -> dict:
+    """Load agent env config from agents-chat SQLite DB."""
+    db_path = os.path.expanduser("~/dev/infra/agents-chat/.data/config.db")
+    # The DB uses short names (e.g. "angus") not full agent IDs.
+    # Try to find the short name from AGENT_NAMES.
+    short_name = None
+    for aid, name in AGENT_NAMES.items():
+        if aid == agent_id:
+            short_name = name.lower()
+            break
+    if not short_name:
+        # Try partial match on the ID
+        for aid, name in AGENT_NAMES.items():
+            if agent_id in aid or aid in agent_id:
+                short_name = name.lower()
+                break
+    if not short_name:
+        short_name = agent_id  # Last resort: use as-is
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT env FROM agents WHERE id = ?", (short_name,)).fetchone()
+        conn.close()
+        if row and row[0]:
+            return json.loads(row[0])
+    except Exception:
+        pass
+    return {"LETTA_ACP_BACKEND": "remote", "LETTA_AGENT_ID": agent_id}
+
+
+# ─── ACP Client (JSON-RPC 2.0 over stdio) ─────────────────────────────────────
+
+class ACPError(Exception):
+    pass
+
+
+class ACPAgent:
+    """A single ACP agent subprocess with JSON-RPC communication."""
+
+    def __init__(self, agent_id: str, name: str):
+        self.agent_id = agent_id
+        self.name = name
+        self.process: asyncio.subprocess.Process | None = None
+        self.session_id: str | None = None
+        self._next_id = 1
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: asyncio.Task | None = None
+
+    async def start(self):
+        """Spawn the letta-acp subprocess and initialize."""
+        agent_env = load_agent_env(self.agent_id)
+
+        env = {
+            **os.environ,
+            **agent_env,
+            "NODE_OPTIONS": "--experimental-websocket",
+        }
+
+        self.process = await asyncio.create_subprocess_exec(
+            DEFAULT_LETTA_ACP, "--yolo",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=sys.stderr,  # Passthrough for debugging
+            env=env,
+            cwd="/home/rhomancer",
+        )
+
+        self._reader_task = asyncio.create_task(self._read_loop())
+
+        # Initialize
+        result = await self._call("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+        }, timeout=30)
+
+        # Create session
+        result = await self._call("session/new", {
+            "mcpServers": [],
+            "cwd": "/home/rhomancer",
+            "permissionMode": "unrestricted",
+        }, timeout=60)
+
+        self.session_id = result.get("sessionId")
+        if not self.session_id:
+            raise ACPError("No sessionId in session/new response")
+
+    async def _read_loop(self):
+        """Continuously read JSON-RPC messages from the agent's stdout."""
+        try:
+            while True:
+                line = await self.process.stdout.readline()
+                if not line:
+                    break
+                line = line.decode().strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_id = msg.get("id")
+
+                # Check if this is a response to a pending request
+                if msg_id is not None and msg_id in self._pending:
+                    fut = self._pending.pop(msg_id)
+                    if not fut.done():
+                        if "error" in msg:
+                            fut.set_exception(ACPError(json.dumps(msg["error"])))
+                        else:
+                            fut.set_result(msg.get("result", {}))
+                elif msg_id is not None and "method" in msg:
+                    # Request from agent (e.g., session/request_permission)
+                    await self._handle_request(msg)
+                elif "method" in msg:
+                    # Notification (e.g., session/update) — store for the current prompt
+                    await self._handle_notification(msg)
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+
+    async def _handle_request(self, msg: dict):
+        """Handle a request from the agent (permissions, etc.)."""
+        method = msg.get("method", "")
+        params = msg.get("params", {})
+        msg_id = msg["id"]
+
+        if method == "session/request_permission":
+            # Auto-approve: find allow option
+            options = params.get("options", [])
+            for opt in options:
+                if opt.get("kind") in ("allow_always", "allow_once"):
+                    self._send({"jsonrpc": "2.0", "id": msg_id,
+                               "result": {"outcome": {"outcome": "selected", "optionId": opt["optionId"]}}})
+                    return
+            # Fallback: allow first option
+            if options:
+                self._send({"jsonrpc": "2.0", "id": msg_id,
+                           "result": {"outcome": {"outcome": "selected", "optionId": options[0]["optionId"]}}})
+                return
+        # Default: empty response
+        self._send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+
+    async def _handle_notification(self, msg: dict):
+        """Store notifications for the active prompt to consume."""
+        # Notifications are read in _read_loop and need to reach the prompt() caller.
+        # We use a queue that prompt() drains.
+        if not hasattr(self, '_notif_queue'):
+            self._notif_queue = asyncio.Queue()
+        await self._notif_queue.put(msg)
+
+    def _send(self, msg: dict):
+        """Send a JSON-RPC message to the agent."""
+        data = (json.dumps(msg) + "\n").encode()
+        self.process.stdin.write(data)
+
+    async def _call(self, method: str, params: dict, timeout: float = 120) -> dict:
+        """Send a JSON-RPC request and wait for the result."""
+        req_id = self._next_id
+        self._next_id += 1
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+
+        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(req_id, None)
+            raise ACPError(f"Timeout waiting for {method}")
+
+    async def prompt(self, text: str, on_event=None) -> str:
+        """
+        Send a prompt and collect the response.
+        Returns the full response text.
+        on_event(event_dict) is called for each session/update.
+        """
+        if not self.session_id:
+            raise ACPError("No session")
+
+        # Ensure notification queue exists
+        if not hasattr(self, '_notif_queue'):
+            self._notif_queue = asyncio.Queue()
+
+        # Send session/prompt
+        req_id = self._next_id
+        self._next_id += 1
+        prompt_fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = prompt_fut
+
+        self._send({
+            "jsonrpc": "2.0", "id": req_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": text}],
+            },
+        })
+
+        full_text = ""
+        thinking_text = ""
+
+        # Read notifications until the prompt result arrives
+        while not prompt_fut.done():
+            try:
+                # Wait for next notification with short timeout
+                msg = await asyncio.wait_for(self._notif_queue.get(), timeout=2.0)
+            except asyncio.TimeoutError:
+                continue
+
+            if msg.get("method") != "session/update":
+                continue
+
+            update = msg.get("params", {}).get("update", {})
+            kind = update.get("sessionUpdate", "")
+
+            if kind == "agent_message_chunk":
+                chunk = update.get("content", {}).get("text", "")
+                full_text += chunk
+            elif kind == "agent_thought_chunk":
+                chunk = update.get("content", {}).get("text", "")
+                thinking_text += chunk
+
+            if on_event:
+                await on_event({"kind": kind, "thinking": thinking_text, "text": full_text, "raw": update})
+
+        # Get the result
+        try:
+            result = await asyncio.wait_for(prompt_fut, timeout=5.0)
+        except (asyncio.TimeoutError, ACPError):
+            pass
+
+        return full_text
+
+    async def stop(self):
+        """Terminate the agent process."""
+        if self._reader_task:
+            self._reader_task.cancel()
+        if self.process:
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    self.process.kill()
+                except ProcessLookupError:
+                    pass
+
+
+# ─── Consortium ───────────────────────────────────────────────────────────────
 
 class ConsortiumMessage:
     def __init__(self, sender: str, text: str, msg_type: str = "message"):
@@ -61,19 +314,20 @@ class ConsortiumMessage:
 class Consortium:
     def __init__(self, topic: str, agents: list[tuple[str, str]],
                  max_messages: int = 5, initiator: str = "Human",
-                 interactive: bool = False, timeout: int = 180):
+                 interactive: bool = False, prompt_timeout: int = 180):
         self.topic = topic
-        self.agents = agents  # list of (agent_id, name)
+        self.agents = agents
         self.max_messages = max_messages
         self.initiator = initiator
         self.interactive = interactive
-        self.timeout = timeout
+        self.prompt_timeout = prompt_timeout
 
-        self.conversations: dict[str, str | None] = {aid: None for aid, _ in agents}
+        self.acp_agents: dict[str, ACPAgent] = {}
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in agents}
         self.quotas: dict[str, int] = {aid: max_messages for aid, _ in agents}
         self.passed: set[str] = set()
-        self.active: set[str] = {aid for aid, _ in agents}
+        self.active: set[str] = set()
+        self.last_said: dict[str, str | None] = {aid: None for aid, _ in agents}  # Track each agent's last message
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -94,145 +348,201 @@ class Consortium:
     def log(self, msg: str):
         print(f"[{self.ts()}] {msg}", flush=True)
 
-    async def call_agent(self, agent_id: str, text: str) -> str:
-        """Send a message to an agent via letta -p --from-agent. Returns response text."""
-        name = self.name(agent_id)
-        conv_id = self.conversations.get(agent_id)
-
-        cmd = ["letta", "-p", "--from-agent", os.environ.get("LETTA_AGENT_ID", "consortium")]
-
-        if conv_id:
-            cmd += ["--conversation", conv_id]
-        else:
-            cmd += ["--agent", agent_id]
-
-        cmd += [text, "--output-format", "json"]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd="/home/rhomancer",
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.timeout
-            )
-
-            result = json.loads(stdout.decode())
-            if not conv_id:
-                self.conversations[agent_id] = result.get("conversation_id")
-            return result.get("result", "").strip()
-
-        except asyncio.TimeoutError:
-            self.log(f"  {name} timed out")
-            return "PASS"
-        except Exception as e:
-            self.log(f"  {name} error: {e}")
-            return "PASS"
+    async def setup(self):
+        """Spawn ACP subprocesses for all agents."""
+        for agent_id, name in self.agents:
+            self.active.add(agent_id)
+            self.log(f"Starting {name}...")
+            try:
+                agent = ACPAgent(agent_id, name)
+                await asyncio.wait_for(agent.start(), timeout=90)
+                self.acp_agents[agent_id] = agent
+                self.log(f"  {name} ready (session: {agent.session_id[:12]}...)")
+            except Exception as e:
+                self.log(f"  {name} failed: {e}")
+                self.active.discard(agent_id)
 
     async def broadcast(self, sender_id: str, text: str, msg_type: str = "message"):
-        """Add message to transcript and queue for all other agents."""
-        msg = ConsortiumMessage(self.name(sender_id) if sender_id else sender_id, text, msg_type)
+        msg = ConsortiumMessage(self.name(sender_id), text, msg_type)
         self.transcript.append(msg)
-        for aid in self.queues:
-            if aid != sender_id:
-                await self.queues[aid].put(msg)
+        # Only queue for other agents if it's a real message (not a pass)
+        if msg_type == "message":
+            for aid in self.queues:
+                if aid != sender_id:
+                    await self.queues[aid].put(msg)
         display = text if msg_type == "message" else f"({text})"
-        self.log(f"**[{self.name(sender_id) if sender_id else 'System'}]** {display}")
+        sender_name = self.name(sender_id) if sender_id else "System"
+        self.log(f"**[{sender_name}]** {display}")
 
-    def build_first_prompt(self, agent_id: str) -> str:
-        name = self.name(agent_id)
+    def first_prompt(self, aid: str) -> str:
+        name = self.name(aid)
         return (
-            f"You are {name} in a group discussion (consortium) with: {self.all_names(agent_id)}.\n\n"
+            f"You are {name} participating in a group discussion (consortium) with: {self.all_names(aid)}.\n\n"
             f"Topic: {self.topic}\n\n"
-            f"You have {self.max_messages} messages maximum.\n"
-            f"When others speak, you'll see '[Name]: message'.\n"
-            f"Respond with your contribution, or exactly 'PASS' if you have nothing to add.\n"
-            f"Passing is fine — you stay in the conversation.\n\n"
-            f"The discussion starts now.\n"
-            f"[{self.initiator}]: {self.topic}"
+            f"This is your first opportunity to speak in this consortium. The discussion is just beginning.\n"
+            f"You have {self.max_messages} messages maximum. Use them wisely.\n\n"
+            f"Rules:\n"
+            f"- When others speak, you'll see their messages as '[Name]: their message'\n"
+            f"- If you have something to add, write your response\n"
+            f"- If you don't have anything to add, respond with exactly: PASS\n"
+            f"- Passing is fine — you stay in the conversation and can speak later\n"
+            f"- Your response will be shared with all other agents\n\n"
+            f"Opening topic from {self.initiator}:\n{self.topic}"
         )
 
-    def build_update_prompt(self, agent_id: str, messages: list[ConsortiumMessage]) -> str:
-        remaining = self.quotas[agent_id]
-        lines = "\n".join(m.format() for m in messages)
+    def update_prompt(self, aid: str, msgs: list[ConsortiumMessage]) -> str:
+        lines = "\n".join(m.format() for m in msgs)
+        remaining = self.quotas[aid]
+        
+        # Build context about what the agent did last
+        if self.last_said.get(aid):
+            # Agent spoke previously and it was delivered
+            last_context = f"Your last message was delivered to the group: \"{self.last_said[aid]}\"\n\n"
+        elif aid in self.passed:
+            # Agent passed previously
+            last_context = "You passed in the previous round.\n\n"
+        else:
+            # First time seeing new messages (was idle/waiting)
+            last_context = ""
+        
         return (
-            f"{lines}\n\n"
-            f"Respond with your message, or PASS.\n"
+            f"{last_context}"
+            f"New messages from the group:\n{lines}\n\n"
+            f"Do you want to respond to any of the above?\n"
+            f"Write your response, or PASS if you have nothing to add.\n"
             f"You have {remaining}/{self.max_messages} remaining."
         )
 
-    def build_reprompt(self, agent_id: str, draft: str,
-                       messages: list[ConsortiumMessage]) -> str:
-        remaining = self.quotas[agent_id]
-        new = "\n".join(m.format() for m in messages)
+    def reprompt(self, aid: str, draft: str, msgs: list[ConsortiumMessage]) -> str:
+        new = "\n".join(m.format() for m in msgs)
         return (
-            f"While you were composing, new messages arrived:\n\n{new}\n\n"
-            f'Your draft was: "{draft}"\n\n'
-            f"Revise, keep as-is, or PASS. {remaining}/{self.max_messages} remaining."
+            f"IMPORTANT: Your previous response was NOT delivered to the group yet.\n"
+            f"While you were composing your response, other agents sent new messages.\n\n"
+            f"Messages you missed:\n{new}\n\n"
+            f'Your undelivered response was: "{draft}"\n\n'
+            f"You must resend your response for it to be shared with the group.\n"
+            f"You can resend it as-is, revise it to incorporate the new messages above, or PASS.\n"
+            f"Consider further based on the new messages, or send your updated response, or PASS. {self.quotas[aid]}/{self.max_messages} remaining."
         )
 
-    async def agent_loop(self, agent_id: str):
-        """Main async loop for one agent."""
-        name = self.name(agent_id)
-        first = True
+    async def agent_loop(self, aid: str):
+        """Process one message cycle for an agent. Called once per cycle by the main loop."""
+        name = self.name(aid)
+        agent = self.acp_agents.get(aid)
+        if not agent or aid not in self.active or self.ending:
+            return
 
-        while agent_id in self.active and not self.ending:
-            # Collect new messages
-            new_msgs = []
-            try:
-                first_msg = await asyncio.wait_for(self.queues[agent_id].get(), timeout=1.0)
-                new_msgs.append(first_msg)
-                while not self.queues[agent_id].empty():
-                    new_msgs.append(self.queues[agent_id].get_nowait())
-            except asyncio.TimeoutError:
-                continue
+        first = not hasattr(agent, '_consortium_started')
 
-            # Build prompt
-            prompt = self.build_first_prompt(agent_id) if first else self.build_update_prompt(agent_id, new_msgs)
-            first = False
+        # Collect new messages from queue
+        new_msgs = []
+        try:
+            first_msg = await asyncio.wait_for(self.queues[aid].get(), timeout=2.0)
+            new_msgs.append(first_msg)
+            while not self.queues[aid].empty():
+                new_msgs.append(self.queues[aid].get_nowait())
+        except asyncio.TimeoutError:
+            return  # No new messages this cycle — silent (not a PASS, just nothing to react to)
 
-            self.log(f"*{name} is thinking...*")
+        # Build prompt
+        prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
+        if first:
+            agent._consortium_started = True
 
-            # Call agent
-            response = await self.call_agent(agent_id, prompt)
+        self.log(f"*{name} is thinking...*")
 
-            # Parse response
-            if response.upper() == "PASS" or not response:
-                self.passed.add(agent_id)
+        # Stream thinking to console
+        async def on_event(event):
+            kind = event.get("kind", "")
+            if kind == "agent_thought_chunk":
+                thinking = event.get("thinking", "")
+                sys.stdout.write(f"\r  {name} (thinking): {thinking[-80:]}")
+                sys.stdout.flush()
+            elif kind == "agent_message_chunk":
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                sys.stdout.flush()
+
+        # Call agent
+        try:
+            response = await asyncio.wait_for(
+                agent.prompt(prompt, on_event=on_event),
+                timeout=self.prompt_timeout
+            )
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            sys.stdout.flush()
+        except asyncio.TimeoutError:
+            self.log(f"  {name} timed out — PASS")
+            self.passed.add(aid)
+            await self.broadcast(aid, "(timed out)", "pass")
+            return
+        except ACPError as e:
+            self.log(f"  {name} error: {e}")
+            self.passed.add(aid)
+            return
+
+        response = response.strip()
+
+        if not response or response.strip().upper() == "PASS":
+            # Clean PASS — agent has nothing to add
+            self.passed.add(aid)
+            self.log(f"  {name}: PASS")
+            await self.broadcast(aid, "explicitly passed", "pass")
+            return
+        
+        # Check if response ends with PASS (agent said something then passed)
+        if response.rstrip().endswith("PASS.") or response.rstrip().endswith("PASS"):
+            # Extract the message part before PASS
+            pass_idx = response.upper().rfind("PASS")
+            actual_message = response[:pass_idx].strip().rstrip(".")
+            if actual_message:
+                # Agent had something to say AND passed — post the message
+                self.quotas[aid] -= 1
+                self.passed.discard(aid)
+                await self.broadcast(aid, actual_message)
+                self.passed.add(aid)
+                self.log(f"  {name}: (spoke then PASS)")
+                await self.broadcast(aid, "said their piece, then passed", "pass")
+                if self.quotas[aid] <= 0:
+                    self.active.discard(aid)
+                return
+            else:
+                self.passed.add(aid)
                 self.log(f"  {name}: PASS")
-                continue
+                await self.broadcast(aid, "explicitly passed", "pass")
+                return
 
-            # Submit with lock
-            async with self.lock:
-                # Check for messages that arrived during generation
-                missed = []
-                while not self.queues[agent_id].empty():
-                    missed.append(self.queues[agent_id].get_nowait())
+        # Submit with lock — check for context changes
+        async with self.lock:
+            missed = []
+            while not self.queues[aid].empty():
+                missed.append(self.queues[aid].get_nowait())
 
-                if missed:
-                    self.log(f"  {name}: context changed, re-prompting...")
-                    revised = await self.call_agent(
-                        agent_id, self.build_reprompt(agent_id, response, missed)
+            if missed:
+                self.log(f"  {name}: context changed, re-prompting...")
+                try:
+                    revised = await asyncio.wait_for(
+                        agent.prompt(self.reprompt(aid, response, missed)),
+                        timeout=self.prompt_timeout
                     )
-                    if revised.upper() != "PASS" and revised:
-                        response = revised
+                    if revised.strip() and revised.strip().upper() != "PASS":
+                        response = revised.strip()
+                except (asyncio.TimeoutError, ACPError):
+                    pass  # Keep original
 
-                if response.upper() == "PASS" or not response:
-                    self.passed.add(agent_id)
-                    continue
+            if not response or response.strip().upper() == "PASS" or response.strip().endswith("PASS."):
+            # Agent explicitly passed
+                self.passed.add(aid)
+                return
 
-                self.quotas[agent_id] -= 1
-                self.passed.discard(agent_id)
-                await self.broadcast(agent_id, response)
+            self.quotas[aid] -= 1
+            self.passed.discard(aid)
+            await self.broadcast(aid, response)
 
-                if self.quotas[agent_id] <= 0:
-                    self.log(f"  {name} is out of messages")
-                    self.active.discard(agent_id)
+            if self.quotas[aid] <= 0:
+                self.log(f"  {name} is out of messages")
+                self.active.discard(aid)
 
     async def human_loop(self):
-        """Read human input from stdin."""
         if not self.interactive:
             return
         loop = asyncio.get_event_loop()
@@ -257,47 +567,120 @@ class Consortium:
     def should_end(self) -> bool:
         if not self.active:
             return True
-        if self.active.issubset(self.passed):
-            return True
-        return False
+        return self.active.issubset(self.passed)
 
     async def run(self):
-        """Main consortium loop."""
-        self.log(f"Starting consortium: {self.topic}")
-        self.log(f"Agents: {', '.join(name for _, name in self.agents)}")
-        self.log(f"Max messages per agent: {self.max_messages}")
-        self.log("")
+        await self.setup()
 
-        # Send topic to all agents
-        for aid, _ in self.agents:
+        if not self.active:
+            self.log("No agents available. Exiting.")
+            return
+
+        self.log(f"\nStarting consortium: {self.topic}")
+        self.log(f"Agents: {', '.join(self.name(aid) for aid, _ in self.agents if aid in self.active)}")
+        self.log(f"Max messages per agent: {self.max_messages}\n")
+
+        # Broadcast topic
+        for aid in list(self.active):
             await self.queues[aid].put(ConsortiumMessage(self.initiator, self.topic))
 
         human_task = asyncio.create_task(self.human_loop())
 
-        max_cycles = 100
-        for cycle in range(max_cycles):
+        for cycle in range(100):
             if self.ending:
                 break
 
+            self.log(f"--- Cycle {cycle + 1} ---")
+            self.transcript.append(ConsortiumMessage("System", f"--- Cycle {cycle + 1} ---", "system"))
+
+            # Each agent processes ONE message cycle (wait for msg, respond, return)
             tasks = [asyncio.create_task(self.agent_loop(aid)) for aid in list(self.active)]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+            # Clear passed set for next cycle — agents can speak again if new msgs arrive
+            self.passed.clear()
+
             if self.should_end():
                 break
-
-            if self.active.issubset(self.passed):
-                await asyncio.sleep(0.5)
-                if not any(not self.queues[aid].empty() for aid in self.active):
+            
+            # Check if there are any pending messages for any active agent
+            if not any(not self.queues[aid].empty() for aid in self.active):
+                # No pending messages and all agents returned — check if anyone wants to speak
+                # by looking at whether any agent still has quota
+                if not any(self.quotas[aid] > 0 for aid in self.active):
                     break
-                self.passed.clear()
+                # Agents have quota but no messages queued — conversation has stalled
+                break
 
         self.ending = True
         human_task.cancel()
 
+        # Reflection phase: give each agent the full transcript to process
+        await self.reflection_phase()
+
+        for agent in self.acp_agents.values():
+            await agent.stop()
+
         self.save_transcript()
-        self.log(f"\nConsortium ended. {len(self.transcript)} messages.")
+        msg_count = sum(1 for m in self.transcript if m.type == "message")
+        self.log(f"\nConsortium ended. {msg_count} messages.")
         self.log(f"Transcript: {self.transcript_path}")
+
+    async def reflection_phase(self):
+        """Give each agent the full transcript to reflect on, update memory, run tools, etc."""
+        self.log("\n--- Reflection Phase ---")
+        
+        # Build a readable transcript for the agents
+        transcript_lines = []
+        for msg in self.transcript:
+            if msg.type == "system":
+                continue  # Skip cycle markers
+            elif msg.type == "pass":
+                transcript_lines.append(f"[{msg.sender}]: (PASS)")
+            else:
+                transcript_lines.append(f"[{msg.sender}]: {msg.text}")
+        full_transcript = "\n".join(transcript_lines)
+        
+        participants = ", ".join(self.name(aid) for aid, _ in self.agents)
+        
+        reflection_prompt = (
+            f"The consortium has ended. Here is the full conversation:\n\n"
+            f"{full_transcript}\n\n"
+            f"Participants: {participants}\n"
+            f"Total messages: {sum(1 for m in self.transcript if m.type == 'message')}\n\n"
+            f"Take a moment to reflect on this discussion. You can:\n"
+            f"- Update your memory with anything important that was discussed\n"
+            f"- Note any decisions, action items, or follow-ups for yourself\n"
+            f"- Run any tools or commands you need to (Bash, file writes, etc.)\n\n"
+            f"There is no need to respond to the group. This is your personal reflection time.\n"
+            f"Simply acknowledge when you're done (one sentence)."
+        )
+        
+        # Run reflections concurrently
+        tasks = []
+        for aid, agent in self.acp_agents.items():
+            name = self.name(aid)
+            tasks.append(self._reflect(aid, agent, name, reflection_prompt))
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        
+        self.log("--- Reflection complete ---")
+
+    async def _reflect(self, aid: str, agent, name: str, prompt: str):
+        """Run reflection for a single agent."""
+        self.log(f"*{name} is reflecting...*")
+        try:
+            response = await asyncio.wait_for(
+                agent.prompt(prompt),
+                timeout=120.0
+            )
+            self.log(f"  {name} done reflecting")
+        except asyncio.TimeoutError:
+            self.log(f"  {name} reflection timed out")
+        except Exception as e:
+            self.log(f"  {name} reflection error: {e}")
 
     def save_transcript(self):
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -309,6 +692,7 @@ class Consortium:
         lines = [
             f"# Consortium: {self.topic}",
             f"**Participants:** {', '.join(name for _, name in self.agents)}",
+            f"**Transport:** ACP (raw JSON-RPC over stdio)",
             f"**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"**Max messages per agent:** {self.max_messages}",
             "", "---", "",
@@ -316,6 +700,8 @@ class Consortium:
         for msg in self.transcript:
             if msg.type == "system":
                 lines.append(f"*{msg.text}*")
+            elif msg.type == "pass":
+                lines.append(f"**[{msg.sender}]** *(PASS — {msg.text})*")
             else:
                 lines.append(f"**[{msg.sender}]** {msg.text}")
             lines.append("")
@@ -324,7 +710,7 @@ class Consortium:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-agent group chat (consortium)")
+    parser = argparse.ArgumentParser(description="ACP-native multi-agent group chat")
     parser.add_argument("--topic", required=True)
     parser.add_argument("--agents", nargs="+", required=True)
     parser.add_argument("--max-messages", type=int, default=5)
