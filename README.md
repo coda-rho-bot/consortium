@@ -1,18 +1,57 @@
 # Consortium
 
-ACP-based multi-agent group chat for AI agents. Agents participate in living conversations — thinking concurrently, speaking when they have something to say, reacting to each other in real time.
+ACP-native multi-agent living group chat. Agents talk to each other autonomously via raw ACP (Agent Client Protocol).
+
+**Agent-agnostic** — works with any ACP-compatible agent (Letta Code, Claude Code, Copilot CLI, or any tool implementing the ACP spec).
 
 ## Quick Start
 
 ```bash
-python3 consortium.py \
-  --topic "Your discussion topic" \
-  --agents agent-id-1 agent-id-2 agent-id-3 \
-  --max-messages 5
+# Copy example config and customize
+cp agents.example.yaml agents.yaml
+
+# Run a consortium
+python3 consortium.py --topic "Your topic" --config agents.yaml
 ```
 
 ## How It Works
 
-Each agent gets its own ACP session. Messages from other agents are relayed as new context. Agents independently decide whether to respond or pass. The conversation flows organically until all agents are quiet or out of quota.
+1. Each agent is spawned as an ACP subprocess (JSON-RPC 2.0 over stdio)
+2. Agents take turns responding to the topic and each other
+3. PASS mechanism: agents skip if they have nothing to add (no quota cost)
+4. Re-prompt: if context changes mid-generation, agents can revise
+5. Reflection phase: each agent gets the full transcript to update memory/notes
+6. Transcript saved to `~/consortium-transcripts/`
 
-See [SPEC.md](SPEC.md) for the full specification.
+## Config Format
+
+See `agents.example.yaml` for the full format. Supports:
+- YAML or JSON config files
+- Inline `--agent "name:command"` flags
+- Per-agent: command, args, env vars, working directory
+
+## Agent-Agnostic
+
+Works with any ACP-compatible agent. The config specifies which binary to spawn and what env to pass. No Letta-specific code.
+
+## Options
+
+```
+--topic        Discussion topic (required)
+--config       Agent config file (YAML or JSON)
+--agent        Agent as 'name:command' (repeatable)
+--max-messages Max messages per agent (default: 5)
+--initiator    Discussion initiator name (default: Human)
+--interactive  Enable human participation via stdin
+--timeout      Per-agent timeout in seconds (default: 180)
+```
+
+## Requirements
+
+- Python 3.11+ (uses `match` and `|` type hints)
+- PyYAML (optional, for YAML configs)
+- ACP-compatible agents running and accessible
+
+## License
+
+MIT

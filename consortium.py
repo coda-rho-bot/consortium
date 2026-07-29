@@ -3,17 +3,25 @@
 Consortium — ACP-native multi-agent group chat.
 
 Agents participate in living conversations via raw ACP (Agent Client Protocol).
-Each agent is spawned as a letta-acp subprocess, communicating via JSON-RPC 2.0
-over stdio. Agent-agnostic — works with any ACP-compatible agent.
+Each agent is spawned as an ACP-compatible subprocess, communicating via
+JSON-RPC 2.0 over stdio. Agent-agnostic — works with ANY ACP-compatible agent
+(letta-acp, Claude Code, Copilot CLI, or any tool implementing the ACP spec).
 
 Usage:
-    python3 consortium.py \\
-        --topic "How should we organize the build system?" \\
-        --agents angus beacon sinter \\
+    # With a config file (recommended):
+    python3 consortium.py \
+        --topic "How should we organize the build system?" \
+        --config agents.yaml
+
+    # With explicit agent flags:
+    python3 consortium.py \
+        --topic "..." \
+        --agent "alice:copilot.exe" \
+        --agent "bob:letta-acp --yolo" \
         --max-messages 5
 
-    python3 consortium.py --topic "..." --agents angus beacon --interactive
-    python3 consortium.py --topic "..." --agents angus beacon --initiator $LETTA_AGENT_ID
+    # Interactive mode (human participates):
+    python3 consortium.py --topic "..." --config agents.yaml --interactive
 """
 
 import argparse
@@ -21,63 +29,83 @@ import asyncio
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-# ─── Agent Registry ───────────────────────────────────────────────────────────
-
-AGENT_NAMES = {
-    "agent-b499137a-e1dd-4427-b9df-73e87adfce9e": "Coda",
-    "agent-c51de213-2275-4d1d-9ed4-8ccfb7047e52": "Angus",
-    "agent-e6f1a549-e06c-4510-b8ea-506f0ebbd211": "Beacon",
-    "agent-2ee946fb-e74c-4628-9d9a-705fa567afb3": "FORGE",
-    "agent-5b2254e8-9582-4b39-87be-c9776c958c95": "Sinter",
-    "agent-8c1f9353-481d-414c-8e35-2da9c16db269": "Linus",
-}
-
-DEFAULT_LETTA_ACP = os.path.expanduser("~/.nvm/versions/node/v22.22.3/bin/letta-acp")
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 
-def resolve_agent(name_or_id: str) -> tuple[str, str]:
-    if name_or_id.startswith("agent-"):
-        return name_or_id, AGENT_NAMES.get(name_or_id, name_or_id[:12])
-    for aid, name in AGENT_NAMES.items():
-        if name.lower() == name_or_id.lower() or name_or_id.lower() in aid:
-            return aid, name
-    return name_or_id, name_or_id[:12]
+# ─── Agent Config ─────────────────────────────────────────────────────────────
+
+def load_config(config_path: str | None = None) -> dict:
+    """Load agent configuration from YAML or JSON file.
+
+    Config format (YAML):
+        agents:
+          - id: alice
+            name: Alice
+            command: copilot.exe
+            args: ["--yolo"]
+            env:
+              API_KEY: xxx
+            cwd: /home/user
+
+          - id: bob
+            name: Bob
+            command: letta-acp
+            args: ["--yolo"]
+            env:
+              LETTA_ACP_BACKEND: remote
+              LETTA_AGENT_ID: agent-xxx
+              LETTA_APP_SERVER_URL: ws://127.0.0.1:14601
+
+    Config format (JSON): same structure as above.
+
+    If no config file, returns empty dict (agents must be provided via --agent flags).
+    """
+    if not config_path:
+        return {"agents": []}
+
+    path = Path(config_path).expanduser()
+    if not path.exists():
+        print(f"Error: config file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    text = path.read_text()
+
+    if path.suffix in ('.yaml', '.yml'):
+        if not HAS_YAML:
+            print("Error: PyYAML not installed. Install with: pip install pyyaml", file=sys.stderr)
+            sys.exit(1)
+        return yaml.safe_load(text)
+    else:
+        return json.loads(text)
 
 
-def load_agent_env(agent_id: str) -> dict:
-    """Load agent env config from agents-chat SQLite DB."""
-    db_path = os.path.expanduser("~/dev/infra/agents-chat/.data/config.db")
-    # The DB uses short names (e.g. "angus") not full agent IDs.
-    # Try to find the short name from AGENT_NAMES.
-    short_name = None
-    for aid, name in AGENT_NAMES.items():
-        if aid == agent_id:
-            short_name = name.lower()
-            break
-    if not short_name:
-        # Try partial match on the ID
-        for aid, name in AGENT_NAMES.items():
-            if agent_id in aid or aid in agent_id:
-                short_name = name.lower()
-                break
-    if not short_name:
-        short_name = agent_id  # Last resort: use as-is
-    
-    try:
-        conn = sqlite3.connect(db_path)
-        row = conn.execute("SELECT env FROM agents WHERE id = ?", (short_name,)).fetchone()
-        conn.close()
-        if row and row[0]:
-            return json.loads(row[0])
-    except Exception:
-        pass
-    return {"LETTA_ACP_BACKEND": "remote", "LETTA_AGENT_ID": agent_id}
+def parse_agent_flag(flag: str) -> dict:
+    """Parse --agent flag: 'name:command arg1 arg2' → {id, name, command, args}."""
+    parts = flag.split(':', 1)
+    if len(parts) != 2:
+        print(f"Error: --agent must be 'name:command'. Got: {flag}", file=sys.stderr)
+        sys.exit(1)
+
+    name = parts[0].strip()
+    cmd_parts = parts[1].strip().split()
+
+    return {
+        "id": name.lower(),
+        "name": name,
+        "command": cmd_parts[0],
+        "args": cmd_parts[1:] if len(cmd_parts) > 1 else [],
+        "env": {},
+        "cwd": os.path.expanduser("~"),
+    }
 
 
 # ─── ACP Client (JSON-RPC 2.0 over stdio) ─────────────────────────────────────
@@ -89,9 +117,14 @@ class ACPError(Exception):
 class ACPAgent:
     """A single ACP agent subprocess with JSON-RPC communication."""
 
-    def __init__(self, agent_id: str, name: str):
-        self.agent_id = agent_id
-        self.name = name
+    def __init__(self, config: dict):
+        self.agent_id = config["id"]
+        self.name = config.get("name", config["id"])
+        self.command = config["command"]
+        self.args = config.get("args", [])
+        self.env_vars = config.get("env", {})
+        self.cwd = config.get("cwd", os.path.expanduser("~"))
+
         self.process: asyncio.subprocess.Process | None = None
         self.session_id: str | None = None
         self._next_id = 1
@@ -99,27 +132,27 @@ class ACPAgent:
         self._reader_task: asyncio.Task | None = None
 
     async def start(self):
-        """Spawn the letta-acp subprocess and initialize."""
-        agent_env = load_agent_env(self.agent_id)
-
+        """Spawn the ACP subprocess and initialize."""
         env = {
             **os.environ,
-            **agent_env,
-            "NODE_OPTIONS": "--experimental-websocket",
+            **self.env_vars,
         }
 
+        # Build the command (binary + args)
+        full_cmd = [self.command] + self.args
+
         self.process = await asyncio.create_subprocess_exec(
-            DEFAULT_LETTA_ACP, "--yolo",
+            *full_cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr,  # Passthrough for debugging
             env=env,
-            cwd="/home/rhomancer",
+            cwd=self.cwd,
         )
 
         self._reader_task = asyncio.create_task(self._read_loop())
 
-        # Initialize
+        # Initialize ACP protocol
         result = await self._call("initialize", {
             "protocolVersion": 1,
             "clientCapabilities": {},
@@ -128,7 +161,7 @@ class ACPAgent:
         # Create session
         result = await self._call("session/new", {
             "mcpServers": [],
-            "cwd": "/home/rhomancer",
+            "cwd": self.cwd,
             "permissionMode": "unrestricted",
         }, timeout=60)
 
@@ -194,8 +227,6 @@ class ACPAgent:
 
     async def _handle_notification(self, msg: dict):
         """Store notifications for the active prompt to consume."""
-        # Notifications are read in _read_loop and need to reach the prompt() caller.
-        # We use a queue that prompt() drains.
         if not hasattr(self, '_notif_queue'):
             self._notif_queue = asyncio.Queue()
         await self._notif_queue.put(msg)
@@ -312,22 +343,25 @@ class ConsortiumMessage:
 
 
 class Consortium:
-    def __init__(self, topic: str, agents: list[tuple[str, str]],
+    def __init__(self, topic: str, agent_configs: list[dict],
                  max_messages: int = 5, initiator: str = "Human",
                  interactive: bool = False, prompt_timeout: int = 180):
         self.topic = topic
-        self.agents = agents
+        self.agent_configs = agent_configs
         self.max_messages = max_messages
         self.initiator = initiator
         self.interactive = interactive
         self.prompt_timeout = prompt_timeout
 
+        # Build agent registry
+        self.agents = [(c["id"], c.get("name", c["id"])) for c in agent_configs]
+
         self.acp_agents: dict[str, ACPAgent] = {}
-        self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in agents}
-        self.quotas: dict[str, int] = {aid: max_messages for aid, _ in agents}
+        self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
+        self.quotas: dict[str, int] = {aid: max_messages for aid, _ in self.agents}
         self.passed: set[str] = set()
         self.active: set[str] = set()
-        self.last_said: dict[str, str | None] = {aid: None for aid, _ in agents}  # Track each agent's last message
+        self.last_said: dict[str, str | None] = {aid: None for aid, _ in self.agents}
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -350,17 +384,19 @@ class Consortium:
 
     async def setup(self):
         """Spawn ACP subprocesses for all agents."""
-        for agent_id, name in self.agents:
-            self.active.add(agent_id)
+        for config in self.agent_configs:
+            aid = config["id"]
+            name = config.get("name", aid)
+            self.active.add(aid)
             self.log(f"Starting {name}...")
             try:
-                agent = ACPAgent(agent_id, name)
+                agent = ACPAgent(config)
                 await asyncio.wait_for(agent.start(), timeout=90)
-                self.acp_agents[agent_id] = agent
+                self.acp_agents[aid] = agent
                 self.log(f"  {name} ready (session: {agent.session_id[:12]}...)")
             except Exception as e:
                 self.log(f"  {name} failed: {e}")
-                self.active.discard(agent_id)
+                self.active.discard(aid)
 
     async def broadcast(self, sender_id: str, text: str, msg_type: str = "message"):
         msg = ConsortiumMessage(self.name(sender_id), text, msg_type)
@@ -393,18 +429,15 @@ class Consortium:
     def update_prompt(self, aid: str, msgs: list[ConsortiumMessage]) -> str:
         lines = "\n".join(m.format() for m in msgs)
         remaining = self.quotas[aid]
-        
+
         # Build context about what the agent did last
         if self.last_said.get(aid):
-            # Agent spoke previously and it was delivered
             last_context = f"Your last message was delivered to the group: \"{self.last_said[aid]}\"\n\n"
         elif aid in self.passed:
-            # Agent passed previously
             last_context = "You passed in the previous round.\n\n"
         else:
-            # First time seeing new messages (was idle/waiting)
             last_context = ""
-        
+
         return (
             f"{last_context}"
             f"New messages from the group:\n{lines}\n\n"
@@ -442,7 +475,7 @@ class Consortium:
             while not self.queues[aid].empty():
                 new_msgs.append(self.queues[aid].get_nowait())
         except asyncio.TimeoutError:
-            return  # No new messages this cycle — silent (not a PASS, just nothing to react to)
+            return  # No new messages this cycle
 
         # Build prompt
         prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
@@ -483,19 +516,16 @@ class Consortium:
         response = response.strip()
 
         if not response or response.strip().upper() == "PASS":
-            # Clean PASS — agent has nothing to add
             self.passed.add(aid)
             self.log(f"  {name}: PASS")
             await self.broadcast(aid, "explicitly passed", "pass")
             return
-        
+
         # Check if response ends with PASS (agent said something then passed)
         if response.rstrip().endswith("PASS.") or response.rstrip().endswith("PASS"):
-            # Extract the message part before PASS
             pass_idx = response.upper().rfind("PASS")
             actual_message = response[:pass_idx].strip().rstrip(".")
             if actual_message:
-                # Agent had something to say AND passed — post the message
                 self.quotas[aid] -= 1
                 self.passed.discard(aid)
                 await self.broadcast(aid, actual_message)
@@ -530,7 +560,6 @@ class Consortium:
                     pass  # Keep original
 
             if not response or response.strip().upper() == "PASS" or response.strip().endswith("PASS."):
-            # Agent explicitly passed
                 self.passed.add(aid)
                 return
 
@@ -593,30 +622,24 @@ class Consortium:
             self.log(f"--- Cycle {cycle + 1} ---")
             self.transcript.append(ConsortiumMessage("System", f"--- Cycle {cycle + 1} ---", "system"))
 
-            # Each agent processes ONE message cycle (wait for msg, respond, return)
             tasks = [asyncio.create_task(self.agent_loop(aid)) for aid in list(self.active)]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Clear passed set for next cycle — agents can speak again if new msgs arrive
             self.passed.clear()
 
             if self.should_end():
                 break
-            
-            # Check if there are any pending messages for any active agent
+
             if not any(not self.queues[aid].empty() for aid in self.active):
-                # No pending messages and all agents returned — check if anyone wants to speak
-                # by looking at whether any agent still has quota
                 if not any(self.quotas[aid] > 0 for aid in self.active):
                     break
-                # Agents have quota but no messages queued — conversation has stalled
                 break
 
         self.ending = True
         human_task.cancel()
 
-        # Reflection phase: give each agent the full transcript to process
+        # Reflection phase
         await self.reflection_phase()
 
         for agent in self.acp_agents.values():
@@ -628,22 +651,21 @@ class Consortium:
         self.log(f"Transcript: {self.transcript_path}")
 
     async def reflection_phase(self):
-        """Give each agent the full transcript to reflect on, update memory, run tools, etc."""
+        """Give each agent the full transcript to reflect on."""
         self.log("\n--- Reflection Phase ---")
-        
-        # Build a readable transcript for the agents
+
         transcript_lines = []
         for msg in self.transcript:
             if msg.type == "system":
-                continue  # Skip cycle markers
+                continue
             elif msg.type == "pass":
                 transcript_lines.append(f"[{msg.sender}]: (PASS)")
             else:
                 transcript_lines.append(f"[{msg.sender}]: {msg.text}")
         full_transcript = "\n".join(transcript_lines)
-        
+
         participants = ", ".join(self.name(aid) for aid, _ in self.agents)
-        
+
         reflection_prompt = (
             f"The consortium has ended. Here is the full conversation:\n\n"
             f"{full_transcript}\n\n"
@@ -652,20 +674,19 @@ class Consortium:
             f"Take a moment to reflect on this discussion. You can:\n"
             f"- Update your memory with anything important that was discussed\n"
             f"- Note any decisions, action items, or follow-ups for yourself\n"
-            f"- Run any tools or commands you need to (Bash, file writes, etc.)\n\n"
+            f"- Run any tools or commands you need to\n\n"
             f"There is no need to respond to the group. This is your personal reflection time.\n"
             f"Simply acknowledge when you're done (one sentence)."
         )
-        
-        # Run reflections concurrently
+
         tasks = []
         for aid, agent in self.acp_agents.items():
             name = self.name(aid)
             tasks.append(self._reflect(aid, agent, name, reflection_prompt))
-        
+
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         self.log("--- Reflection complete ---")
 
     async def _reflect(self, aid: str, agent, name: str, prompt: str):
@@ -710,26 +731,60 @@ class Consortium:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ACP-native multi-agent group chat")
-    parser.add_argument("--topic", required=True)
-    parser.add_argument("--agents", nargs="+", required=True)
-    parser.add_argument("--max-messages", type=int, default=5)
-    parser.add_argument("--initiator", default="Human")
-    parser.add_argument("--interactive", action="store_true")
-    parser.add_argument("--timeout", type=int, default=180)
+    parser = argparse.ArgumentParser(
+        description="ACP-native multi-agent group chat — works with any ACP-compatible agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # With config file:
+  consortium.py --topic "Design the API" --config agents.yaml
+
+  # With explicit agents (name:command):
+  consortium.py --topic "..." --agent "alice:copilot.exe" --agent "bob:claude"
+
+  # Interactive (human participates):
+  consortium.py --topic "..." --config agents.yaml --interactive
+        """
+    )
+    parser.add_argument("--topic", required=True, help="Discussion topic")
+    parser.add_argument("--config", help="Agent config file (YAML or JSON)")
+    parser.add_argument("--agent", action="append", default=[],
+                        help="Agent in 'name:command' format (can repeat)")
+    parser.add_argument("--max-messages", type=int, default=5,
+                        help="Max messages per agent (default: 5)")
+    parser.add_argument("--initiator", default="Human",
+                        help="Who initiated the discussion (default: Human)")
+    parser.add_argument("--interactive", action="store_true",
+                        help="Enable interactive mode (human can type messages)")
+    parser.add_argument("--timeout", type=int, default=180,
+                        help="Per-agent prompt timeout in seconds (default: 180)")
     args = parser.parse_args()
 
-    resolved = [resolve_agent(a) for a in args.agents]
-    if len(resolved) < 2:
-        print("Error: need at least 2 agents", file=sys.stderr)
+    # Build agent configs
+    agent_configs = []
+
+    if args.config:
+        config = load_config(args.config)
+        agent_configs.extend(config.get("agents", []))
+
+    for flag in args.agent:
+        agent_configs.append(parse_agent_flag(flag))
+
+    if len(agent_configs) < 2:
+        print("Error: need at least 2 agents. Use --config or --agent flags.", file=sys.stderr)
         sys.exit(1)
 
-    initiator = "Human"
-    if args.initiator != "Human" and args.initiator.startswith("agent-"):
-        initiator = AGENT_NAMES.get(args.initiator, args.initiator[:12])
+    # Deduplicate by agent ID
+    seen = set()
+    unique_configs = []
+    for c in agent_configs:
+        if c["id"] not in seen:
+            seen.add(c["id"])
+            unique_configs.append(c)
+    agent_configs = unique_configs
 
-    c = Consortium(args.topic, resolved, args.max_messages, initiator,
-                   args.interactive, args.timeout)
+    c = Consortium(args.topic, agent_configs, args.max_messages,
+                   args.initiator, args.interactive, args.timeout)
     asyncio.run(c.run())
 
 
