@@ -616,7 +616,7 @@ def _extract_message_from_pass(response: str) -> tuple[str | None, bool]:
 class Consortium:
     def __init__(self, topic: str, agent_configs: list[dict],
                  max_messages: int = 5, initiator: str = "Human",
-                 interactive: bool = False, prompt_timeout: int = 180,
+                 interactive: bool = False, prompt_timeout: int = 300,
                  unsafe: bool = False, max_cycles: int = 100):  # M11
         self.topic = topic
         self.agent_configs = agent_configs
@@ -1087,8 +1087,8 @@ Examples:
                         help="Who initiated the discussion (default: Human)")
     parser.add_argument("--interactive", action="store_true",
                         help="Enable interactive mode (human can type messages)")
-    parser.add_argument("--timeout", type=int, default=180,
-                        help="Per-agent prompt timeout in seconds (default: 180)")
+    parser.add_argument("--timeout", type=int, default=300,
+                        help="Per-agent prompt timeout in seconds (default: 300)")
     parser.add_argument("--unsafe", action="store_true",
                         help="Use unrestricted permissions (agents can run any command without approval)")
     parser.add_argument("--max-cycles", type=int, default=100,
