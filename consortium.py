@@ -791,6 +791,14 @@ class Consortium:
             return
 
         response = response.strip()
+
+        # BUG FIX: Treat empty responses as PASS to avoid broadcasting empty messages.
+        # Empty responses provide no value and can cause cascading empty-message cycles.
+        if not response:
+            self.passed.add(aid)
+            self.log(f"  {name}: PASS (empty response)")
+            await self.broadcast(aid, "explicitly passed", "pass")
+            return
         message, passed = _extract_message_from_pass(response)
 
         if passed and message is None:
@@ -934,6 +942,16 @@ class Consortium:
             if all_passed and not has_pending:
                 if not has_quota:
                     break
+
+            # BUG FIX: If no agent received any messages this cycle (all returned
+            # early from empty queue), there's nothing more to discuss.
+            # Without this check, the consortium cycles up to max_cycles × 2s
+            # doing nothing.
+            any_spoke = any(self.last_said.get(aid) is not None or aid in self.passed for aid in self.active)
+            if not has_pending and not all_passed and not any_spoke:
+                # Nobody had messages, nobody spoke, nobody passed — stalemate
+                self.log("No agents have messages to process. Ending.")
+                break
 
             self.prev_passed = set(self.passed)  # M8: snapshot before clearing
             self.passed.clear()
