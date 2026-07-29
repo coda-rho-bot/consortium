@@ -645,6 +645,7 @@ class Consortium:
         self.active: set[str] = set()
         self.last_said: dict[str, str | None] = {aid: None for aid, _ in self.agents}
         self._composing: set[str] = set()  # LLM call in progress
+        self._total_composes: int = 0     # Safety valve: total compose calls across all agents
 
         self.transcript: list[ConsortiumMessage] = []
         self.lock = asyncio.Lock()
@@ -814,6 +815,7 @@ class Consortium:
 
                 self.log(f"*{name} is thinking...*")
                 self._composing.add(aid)
+                self._total_composes += 1
 
                 async def on_event(event):
                     kind = event.get("kind", "")
@@ -997,6 +999,11 @@ class Consortium:
             # Check idle timeout
             idle_seconds = time.time() - self._last_activity
             has_pending = any(not self.queues[aid].empty() for aid in self.active)
+
+            # Safety valve: max_cycles limits total compose calls
+            if self._total_composes >= self.max_cycles * len(self.agents):
+                self.log(f"Safety valve: reached {self._total_composes} total composes. Ending.")
+                break
             anyone_composing = bool(self._composing)
             all_remaining_passed = self.active.issubset(self.passed)
 
