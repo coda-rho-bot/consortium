@@ -1089,9 +1089,10 @@ class Consortium:
             f"Total messages: {sum(1 for m in self.transcript if m.type == 'message')}\n\n"
             f"Take a moment to reflect on this discussion. You can:\n"
             f"- Update your memory with anything important that was discussed\n"
-            f"- Note any decisions, action items, or follow-ups for yourself\n\n"
+            f"- Note any decisions, action items, or follow-ups for yourself\n"
+            f"- Run any tools or commands you need to\n\n"
             f"There is no need to respond to the group. This is your personal reflection time.\n"
-            f"Simply acknowledge when you're done (one sentence). Do NOT run any tools — just acknowledge."
+            f"Simply acknowledge when you're done (one sentence)."
         )
 
         tasks = []
