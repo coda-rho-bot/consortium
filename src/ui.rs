@@ -89,11 +89,11 @@ impl App {
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(3);
+        self.scroll = self.scroll.saturating_add(1);
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(3);
+        self.scroll = self.scroll.saturating_sub(1);
     }
 
     pub fn back(&mut self) {
@@ -340,23 +340,16 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
         lines.push(Line::from("")); // spacing between messages
     }
 
-    let content_height = area.height.saturating_sub(2) as usize; // -2 for borders
-    let total_lines = lines.len();
-    let max_scroll = total_lines.saturating_sub(content_height);
-    app.scroll = app.scroll.min(max_scroll);
-
+    // ratatui Paragraph handles scrolling internally — don't clamp,
+    // just pass the scroll offset. Line wrapping is also handled by ratatui.
     let para = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    " {} (scroll: {}/{}) ",
-                    transcript.display_topic(),
-                    app.scroll,
-                    max_scroll
-                ))
+                .title(format!(" {} ", transcript.display_topic()))
                 .border_style(Style::default().fg(Color::Cyan)),
         )
+        .wrap(Wrap { trim: false })
         .scroll((app.scroll as u16, 0));
 
     frame.render_widget(para, area);
