@@ -300,9 +300,7 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
     )));
     lines.push(Line::from(""));
 
-    // ── Messages with wrapping ──
-    let inner_width = area.width.saturating_sub(4) as usize; // -2 borders, -2 padding
-
+    // ── Messages (let ratatui handle all wrapping) ──
     for msg in &transcript.messages {
         if msg.is_system {
             lines.push(Line::from(Span::styled(
@@ -316,25 +314,28 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
             )));
         } else {
             let color = sender_color(&msg.sender);
-            let prefix = format!("[{}]: ", msg.sender);
-            let prefix_len = prefix.len();
-
-            // Wrap the message text to fit the available width
-            let wrapped = wrap_text(&msg.text, inner_width.saturating_sub(prefix_len));
-
-            // First line includes the sender prefix
-            lines.push(Line::from(vec![
-                Span::styled(
-                    prefix.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(wrapped.first().cloned().unwrap_or_default()),
-            ]));
-
-            // Continuation lines (indented to align with text after prefix)
-            let indent = " ".repeat(prefix_len);
-            for cont_line in wrapped.iter().skip(1) {
-                lines.push(Line::from(Span::raw(format!("{}{}", indent, cont_line))));
+            // Split multi-line messages into separate Line objects
+            for (i, line_text) in msg.text.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("[{}]: ", msg.sender),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(line_text.to_string()),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::raw(line_text.to_string())));
+                }
+            }
+            // If message was empty after stripping, still show the sender
+            if msg.text.lines().count() == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("[{}]: ", msg.sender),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
             }
         }
         lines.push(Line::from("")); // spacing between messages
