@@ -15,6 +15,7 @@ pub struct App {
     pub selected: Option<usize>,
     pub view_mode: ViewMode,
     pub scroll: usize,
+    pub max_scroll: usize,
     pub live_status: Option<ConsortiumStatus>,
     pub live_last_check: std::time::Instant,
 }
@@ -40,6 +41,7 @@ impl App {
             selected: None,
             view_mode: ViewMode::History,
             scroll: 0,
+            max_scroll: 0,
             live_status: None,
             live_last_check: std::time::Instant::now(),
         }
@@ -89,11 +91,27 @@ impl App {
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
+        self.scroll = self.scroll.saturating_add(1).min(self.max_scroll);
     }
 
     pub fn scroll_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_page_down(&mut self, page_size: usize) {
+        self.scroll = self.scroll.saturating_add(page_size).min(self.max_scroll);
+    }
+
+    pub fn scroll_page_up(&mut self, page_size: usize) {
+        self.scroll = self.scroll.saturating_sub(page_size);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll = self.max_scroll;
     }
 
     pub fn back(&mut self) {
@@ -341,8 +359,13 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
         lines.push(Line::from("")); // spacing between messages
     }
 
-    // ratatui Paragraph handles scrolling internally — don't clamp,
-    // just pass the scroll offset. Line wrapping is also handled by ratatui.
+    // ── Compute scroll bounds (accounting for text wrapping) ──
+    let content_width = area.width.saturating_sub(2) as usize;
+    let content_height = area.height.saturating_sub(2) as usize;
+    let total_visual = count_visual_lines(&lines, content_width);
+    app.max_scroll = total_visual.saturating_sub(content_height);
+    app.scroll = app.scroll.min(app.max_scroll);
+
     let para = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
@@ -351,7 +374,7 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll as u16, 0));
+        .scroll((app.scroll.min(u16::MAX as usize) as u16, 0));
 
     frame.render_widget(para, area);
 }
@@ -452,6 +475,12 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     // Auto-scroll to bottom for live view
+    let content_width = area.width.saturating_sub(2) as usize;
+    let content_height = area.height.saturating_sub(2) as usize;
+    let total_visual = count_visual_lines(&lines, content_width);
+    app.max_scroll = total_visual.saturating_sub(content_height);
+    app.scroll = app.max_scroll;
+
     let para = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
@@ -460,7 +489,7 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
                 .border_style(Style::default().fg(Color::Green)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll as u16, 0));
+        .scroll((app.scroll.min(u16::MAX as usize) as u16, 0));
 
     frame.render_widget(para, area);
 }
@@ -478,6 +507,25 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ""
     };
 
+    let scroll_indicator = match app.view_mode {
+        ViewMode::Transcript | ViewMode::Live if app.max_scroll > 0 => {
+            let pct = if app.max_scroll == 0 { 0 } else { app.scroll * 100 / app.max_scroll };
+            let label = if app.scroll == 0 {
+                "Top".to_string()
+            } else if app.scroll >= app.max_scroll {
+                "End".to_string()
+            } else {
+                format!("{}%", pct)
+            };
+            // 10-segment progress bar
+            let filled = (pct as f64 / 10.0).round() as usize;
+            let bar: String = "█".repeat(filled.min(10)) + &"░".repeat(10 - filled.min(10));
+            format!(" ▏{}▕ {} ", bar, label)
+        },
+        ViewMode::Transcript | ViewMode::Live => " ▏ All ▏ ".to_string(),
+        _ => String::new(),
+    };
+
     let line = Line::from(vec![
         Span::styled(
             format!(" {} ", mode_text),
@@ -488,10 +536,13 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             format!("{} consortiums", app.transcripts.len()),
             Style::default().fg(Color::Gray),
         ),
+        Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
         Span::raw(" │ "),
         Span::styled("↑↓ navigate", Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
-        Span::styled("Enter view", Style::default().fg(Color::DarkGray)),
+        Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled("Home/End", Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
         Span::styled("L live", Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
@@ -527,35 +578,25 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
+/// Count how many visual lines the text will occupy after wrapping,
+/// accounting for the content width (area width minus borders).
+fn count_visual_lines(lines: &[Line], content_width: usize) -> usize {
+    if content_width == 0 {
+        return lines.len();
     }
-
-    let mut result = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut current_line = String::new();
-        for word in paragraph.split_whitespace() {
-            // Use char count, not byte length
-            let current_chars = current_line.chars().count();
-            let word_chars = word.chars().count();
-
-            if current_line.is_empty() {
-                current_line = word.to_string();
-            } else if current_chars + 1 + word_chars <= width {
-                current_line.push(' ');
-                current_line.push_str(word);
+    lines
+        .iter()
+        .map(|line| {
+            let line_width: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            if line_width == 0 {
+                1
             } else {
-                if !current_line.is_empty() {
-                    result.push(current_line.clone());
-                }
-                current_line = word.to_string();
+                ((line_width + content_width - 1) / content_width).max(1)
             }
-        }
-        result.push(current_line);
-    }
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
+        })
+        .sum()
 }

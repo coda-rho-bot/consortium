@@ -17,6 +17,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Set terminal window title
+    execute!(stdout, crossterm::terminal::SetTitle("Consortium ACP"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -80,23 +82,41 @@ fn run_app(
                         ViewMode::Live => {}
                     },
                     KeyCode::PageDown => {
-                        for _ in 0..5 {
-                            match app.view_mode {
-                                ViewMode::History => app.next(),
-                                ViewMode::Transcript => app.scroll_down(),
-                                _ => {}
+                        match app.view_mode {
+                            ViewMode::History => {
+                                for _ in 0..5 { app.next(); }
                             }
+                            ViewMode::Transcript => app.scroll_page_down(20),
+                            _ => {}
                         }
                     }
                     KeyCode::PageUp => {
-                        for _ in 0..5 {
-                            match app.view_mode {
-                                ViewMode::History => app.previous(),
-                                ViewMode::Transcript => app.scroll_up(),
-                                _ => {}
+                        match app.view_mode {
+                            ViewMode::History => {
+                                for _ in 0..5 { app.previous(); }
                             }
+                            ViewMode::Transcript => app.scroll_page_up(20),
+                            _ => {}
                         }
                     }
+                    KeyCode::Home => match app.view_mode {
+                        ViewMode::Transcript => app.scroll_to_top(),
+                        ViewMode::History => {
+                            app.list_state.select(Some(0));
+                            app.scroll = 0;
+                        }
+                        _ => {}
+                    },
+                    KeyCode::End => match app.view_mode {
+                        ViewMode::Transcript => app.scroll_to_bottom(),
+                        ViewMode::History => {
+                            if !app.transcripts.is_empty() {
+                                app.list_state.select(Some(app.transcripts.len() - 1));
+                                app.scroll = 0;
+                            }
+                        }
+                        _ => {}
+                    },
                     KeyCode::Enter => match app.view_mode {
                         ViewMode::History => app.open_transcript(),
                         _ => {}

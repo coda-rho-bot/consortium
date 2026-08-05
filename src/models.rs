@@ -187,8 +187,10 @@ fn parse_max_messages(raw: &str) -> usize {
 }
 
 /// Parse messages from transcript markdown.
-/// Messages start with **[Sender]** and can span multiple lines
-/// until the next **[ or --- or end of file.
+/// Messages start with **[Sender]** and can span multiple lines.
+/// The messages section is between the first `---` separator and the
+/// final `---` that precedes `**Ended:**`. Agent messages may contain
+/// `---` (horizontal rules) which must NOT be treated as section boundaries.
 fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
     let mut messages = Vec::new();
     let mut in_messages = false;
@@ -236,7 +238,32 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
         }
     };
 
-    for line in raw.lines() {
+    // Pre-scan: find the line index of the final --- separator (the one before **Ended:**)
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut end_separator_idx: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().starts_with("**Ended:**") {
+            // Walk backwards to find the --- before this
+            for j in (0..i).rev() {
+                if lines[j].trim().starts_with("---") {
+                    end_separator_idx = Some(j);
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    // Fallback: if no **Ended:** found, use the last --- in the file
+    if end_separator_idx.is_none() {
+        for (i, line) in lines.iter().enumerate().rev() {
+            if line.trim().starts_with("---") {
+                end_separator_idx = Some(i);
+                break;
+            }
+        }
+    }
+
+    for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
         // Detect first --- separator (start of messages section)
@@ -251,10 +278,19 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
             continue;
         }
 
-        // End of messages section (second ---)
+        // End of messages section: this --- is the final separator
         if trimmed.starts_with("---") && in_messages {
-            flush(&mut messages, &mut current_sender, &mut current_lines);
-            break;
+            if let Some(end_idx) = end_separator_idx {
+                if idx == end_idx {
+                    flush(&mut messages, &mut current_sender, &mut current_lines);
+                    break;
+                }
+            }
+            // Otherwise, this --- is inside an agent message — treat as continuation
+            if current_sender.is_some() {
+                current_lines.push(line.to_string());
+            }
+            continue;
         }
 
         // New message starts with **[Sender]**
