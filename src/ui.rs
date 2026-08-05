@@ -265,25 +265,44 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header
+    // ── Full details header ──
     lines.push(Line::from(Span::styled(
         &transcript.topic,
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled("Date:           ", Style::default().fg(Color::Yellow)),
+        Span::raw(transcript.display_date()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Participants:   ", Style::default().fg(Color::Yellow)),
+        Span::raw(transcript.display_participants()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Max messages:   ", Style::default().fg(Color::Yellow)),
+        Span::raw(transcript.max_messages.to_string()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Total messages: ", Style::default().fg(Color::Yellow)),
+        Span::raw(transcript.messages.len().to_string()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("File:           ", Style::default().fg(Color::Yellow)),
+        Span::raw(transcript.filename.clone()),
+    ]));
     lines.push(Line::from(Span::styled(
-        format!(
-            "{} • {} • {} msgs",
-            transcript.display_date(),
-            transcript.display_participants(),
-            transcript.messages.len()
-        ),
+        "─────────────────────────────────────────────────────",
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
 
-    // Messages
+    // ── Messages with wrapping ──
+    let inner_width = area.width.saturating_sub(4) as usize; // -2 borders, -2 padding
+
     for msg in &transcript.messages {
         if msg.is_system {
             lines.push(Line::from(Span::styled(
@@ -297,13 +316,26 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
             )));
         } else {
             let color = sender_color(&msg.sender);
+            let prefix = format!("[{}]: ", msg.sender);
+            let prefix_len = prefix.len();
+
+            // Wrap the message text to fit the available width
+            let wrapped = wrap_text(&msg.text, inner_width.saturating_sub(prefix_len));
+
+            // First line includes the sender prefix
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("[{}]: ", msg.sender),
+                    prefix.clone(),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(&msg.text),
+                Span::raw(wrapped.first().cloned().unwrap_or_default()),
             ]));
+
+            // Continuation lines (indented to align with text after prefix)
+            let indent = " ".repeat(prefix_len);
+            for cont_line in wrapped.iter().skip(1) {
+                lines.push(Line::from(Span::raw(format!("{}{}", indent, cont_line))));
+            }
         }
         lines.push(Line::from("")); // spacing between messages
     }
@@ -497,4 +529,33 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let mut result = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut current_line = String::new();
+        for word in paragraph.split_whitespace() {
+            if current_line.is_empty() {
+                current_line = word.to_string();
+            } else if current_line.len() + 1 + word.len() <= width {
+                current_line.push(' ');
+                current_line.push_str(word);
+            } else {
+                result.push(current_line);
+                current_line = word.to_string();
+            }
+        }
+        if !current_line.is_empty() || result.is_empty() {
+            result.push(current_line);
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
 }
