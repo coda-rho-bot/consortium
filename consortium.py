@@ -38,6 +38,8 @@ import os
 import re
 import sys
 import time
+
+STATUS_FILE = os.path.expanduser("~/.consortium-status.json")
 from datetime import datetime
 from pathlib import Path
 
@@ -700,6 +702,28 @@ class Consortium:
         display = text if msg_type == "message" else f"({text})"
         sender_name = self.name(sender_id) if sender_id else "System"
         self.log(f"**[{sender_name}]** {display}")
+        self._write_status()
+
+    def _write_status(self):
+        """Write live status JSON for TUI consumption."""
+        import json
+        status = {
+            "topic": self.topic,
+            "started_at": self._start_time.isoformat() if self._start_time else "",
+            "participants": [name for _, name in self.agents],
+            "max_messages": self.max_messages,
+            "status": "ended" if self.ending else "running",
+            "current_speakers": list(self._composing),
+            "messages": [
+                {"sender": m.sender, "text": m.text, "timestamp": "", "msg_type": m.type}
+                for m in self.transcript
+            ],
+        }
+        try:
+            with open(STATUS_FILE, 'w') as f:
+                json.dump(status, f)
+        except Exception:
+            pass
 
     def first_prompt(self, aid: str) -> str:
         name = self.name(aid)
@@ -937,7 +961,7 @@ class Consortium:
                 line = line_bytes.decode(errors="replace").strip()  # I1: consistent with M7
                 if line == "/end":
                     self.ending = True
-                    break
+                    self._write_status()
                 if line:
                     msg = ConsortiumMessage("Human", line)
                     self.transcript.append(msg)
@@ -961,6 +985,7 @@ class Consortium:
             self.log("Need at least 2 active agents. Exiting.")
             return
 
+        self._write_status()
         self.log(f"\nStarting consortium: {self.topic}")
         self._start_time = datetime.now()
         self._last_activity = time.time()
@@ -1017,6 +1042,7 @@ class Consortium:
                     break
 
         self.ending = True
+        self._write_status()
 
         # Cancel any still-running agent tasks
         for aid, task in agent_tasks.items():
@@ -1065,6 +1091,7 @@ class Consortium:
         self.log(f"\nConsortium ended. {msg_count} messages.")
         if self.transcript_path:
             self.log(f"Transcript: {self.transcript_path}")
+        self._cleanup_status()
 
     async def reflection_phase(self):
         """Give each agent the full transcript to reflect on."""
@@ -1126,6 +1153,13 @@ class Consortium:
             await agent.cancel_session()
         except Exception as e:
             self.log(f"  {name} reflection error: {e}")
+
+    def _cleanup_status(self):
+        """Remove status file when consortium ends."""
+        try:
+            os.remove(STATUS_FILE)
+        except FileNotFoundError:
+            pass
 
     def save_transcript(self):
         try:
