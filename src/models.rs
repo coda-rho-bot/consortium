@@ -74,8 +74,10 @@ impl Transcript {
 
     pub fn display_topic(&self) -> String {
         let t = self.topic.replace('\n', " ");
-        if t.len() > 60 {
-            format!("{}...", &t[..57])
+        let chars: Vec<char> = t.chars().collect();
+        if chars.len() > 60 {
+            let truncated: String = chars[..57].iter().collect();
+            format!("{}...", truncated)
         } else {
             t
         }

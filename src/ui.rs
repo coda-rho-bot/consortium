@@ -524,8 +524,10 @@ fn sender_color(name: &str) -> Color {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max.saturating_sub(3)])
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > max {
+        let truncated: String = chars[..max.saturating_sub(3)].iter().collect();
+        format!("{}...", truncated)
     } else {
         s.to_string()
     }
@@ -540,19 +542,23 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     for paragraph in text.split('\n') {
         let mut current_line = String::new();
         for word in paragraph.split_whitespace() {
+            // Use char count, not byte length
+            let current_chars = current_line.chars().count();
+            let word_chars = word.chars().count();
+
             if current_line.is_empty() {
                 current_line = word.to_string();
-            } else if current_line.len() + 1 + word.len() <= width {
+            } else if current_chars + 1 + word_chars <= width {
                 current_line.push(' ');
                 current_line.push_str(word);
             } else {
-                result.push(current_line);
+                if !current_line.is_empty() {
+                    result.push(current_line.clone());
+                }
                 current_line = word.to_string();
             }
         }
-        if !current_line.is_empty() || result.is_empty() {
-            result.push(current_line);
-        }
+        result.push(current_line);
     }
     if result.is_empty() {
         result.push(String::new());
