@@ -72,23 +72,21 @@ impl Transcript {
         })
     }
 
-    /// Short display topic (truncated)
     pub fn display_topic(&self) -> String {
-        if self.topic.len() > 60 {
-            format!("{}...", &self.topic[..57])
+        let t = self.topic.replace('\n', " ");
+        if t.len() > 60 {
+            format!("{}...", &t[..57])
         } else {
-            self.topic.clone()
+            t
         }
     }
 
-    /// Display date
     pub fn display_date(&self) -> String {
         self.timestamp
             .map(|t| t.format("%b %d %H:%M").to_string())
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Display participants
     pub fn display_participants(&self) -> String {
         if self.participants.is_empty() {
             "?".to_string()
@@ -98,14 +96,14 @@ impl Transcript {
     }
 }
 
-/// Live consortium status (written by consortium.py during execution)
+/// Live consortium status
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConsortiumStatus {
     pub topic: String,
     pub started_at: String,
     pub participants: Vec<String>,
     pub max_messages: usize,
-    pub status: String, // "running", "ended"
+    pub status: String,
     pub messages: Vec<StatusMessage>,
     pub current_speakers: Vec<String>,
 }
@@ -115,7 +113,7 @@ pub struct StatusMessage {
     pub sender: String,
     pub text: String,
     pub timestamp: String,
-    pub msg_type: String, // "message", "pass", "system"
+    pub msg_type: String,
 }
 
 impl ConsortiumStatus {
@@ -142,7 +140,6 @@ pub fn status_file_path() -> PathBuf {
 }
 
 fn parse_timestamp_from_filename(filename: &str) -> Option<DateTime<Local>> {
-    // Format: YYYYMMDD-HHMMSS-slug.md
     let parts: Vec<&str> = filename.splitn(3, '-').collect();
     if parts.len() >= 2 {
         let datetime_str = format!("{}-{}", parts[0], parts[1]);
@@ -154,18 +151,16 @@ fn parse_timestamp_from_filename(filename: &str) -> Option<DateTime<Local>> {
 }
 
 fn parse_topic(raw: &str) -> String {
-    // First line: "# Consortium: {topic}"
     for line in raw.lines() {
-        if line.starts_with("# Consortium:") {
-            return line["# Consortium:".len()..].trim().to_string();
+        let trimmed = line.trim();
+        if trimmed.starts_with("# Consortium:") {
+            return trimmed["# Consortium:".len()..].trim().to_string();
         }
     }
-    // Fallback: use filename slug
     "Untitled".to_string()
 }
 
 fn parse_participants(raw: &str) -> Vec<String> {
-    // Line: "**Participants:** Alice, Bob, Charlie"
     for line in raw.lines() {
         if line.starts_with("**Participants:**") {
             let rest = &line["**Participants:**".len()..];
@@ -189,14 +184,63 @@ fn parse_max_messages(raw: &str) -> usize {
     0
 }
 
+/// Parse messages from transcript markdown.
+/// Messages start with **[Sender]** and can span multiple lines
+/// until the next **[ or --- or end of file.
 fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
     let mut messages = Vec::new();
     let mut in_messages = false;
+    let mut current_sender: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    // Agent name mapping for short IDs
+    let name_map = [
+        ("agent-b499137a", "Coda"),
+        ("agent-c51de213", "Angus"),
+        ("agent-e6f1a549", "Beacon"),
+        ("agent-2ee946fb", "FORGE"),
+        ("agent-5b2254e8", "Sinter"),
+        ("agent-8c1f9353", "Linus"),
+    ];
+
+    let resolve_name = |raw: &str| -> String {
+        for (id, name) in &name_map {
+            if raw.starts_with(id) || raw.contains(id) {
+                return name.to_string();
+            }
+        }
+        raw.to_string()
+    };
+
+    let flush = |messages: &mut Vec<TranscriptMessage>,
+                 sender: &mut Option<String>,
+                 lines: &mut Vec<String>| {
+        if let Some(s) = sender.take() {
+            let text = lines.join("\n");
+            lines.clear();
+
+            let is_pass = text.trim() == "PASS"
+                || text.contains("PASS")
+                || text.contains("(explicitly passed)")
+                || text.contains("(PASS");
+            let is_system = s == "System";
+
+            messages.push(TranscriptMessage {
+                sender: s,
+                text: text.trim().to_string(),
+                is_pass,
+                is_system,
+            });
+        }
+    };
 
     for line in raw.lines() {
-        // Start of messages section
-        if line.starts_with("---") && !in_messages {
-            // Skip the first --- (header separator)
+        let trimmed = line.trim();
+
+        // Detect first --- separator (start of messages section)
+        if trimmed.starts_with("---") && !in_messages {
+            // Flush any pre-message content
+            flush(&mut messages, &mut current_sender, &mut current_lines);
             in_messages = true;
             continue;
         }
@@ -205,36 +249,39 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
             continue;
         }
 
-        // End of messages section
-        if line.starts_with("---") && in_messages {
+        // End of messages section (second ---)
+        if trimmed.starts_with("---") && in_messages {
+            flush(&mut messages, &mut current_sender, &mut current_lines);
             break;
         }
 
-        // Parse message line
-        if line.starts_with("**[") {
-            // Find the closing ]
-            if let Some(end_bracket) = line.find("]**") {
-                let sender = line[3..end_bracket].to_string();
-                let rest = &line[end_bracket + 3..];
+        // New message starts with **[Sender]**
+        if trimmed.starts_with("**[") {
+            // Flush previous message
+            flush(&mut messages, &mut current_sender, &mut current_lines);
 
-                let is_pass = rest.contains("PASS") || rest.contains("(explicitly passed)");
-                let is_system = sender == "System";
+            // Parse sender from **[Sender]**
+            if let Some(end_bracket) = trimmed.find("]**") {
+                let raw_sender = &trimmed[3..end_bracket];
+                let sender = resolve_name(raw_sender);
+                let rest = trimmed[end_bracket + 3..].trim().to_string();
 
-                let text = if is_pass {
-                    "PASS".to_string()
-                } else {
-                    rest.trim().to_string()
-                };
-
-                messages.push(TranscriptMessage {
-                    sender,
-                    text,
-                    is_pass,
-                    is_system,
-                });
+                current_sender = Some(sender);
+                if !rest.is_empty() {
+                    current_lines.push(rest);
+                }
             }
+            continue;
+        }
+
+        // Continuation line for current message
+        if current_sender.is_some() {
+            current_lines.push(line.to_string());
         }
     }
+
+    // Flush last message
+    flush(&mut messages, &mut current_sender, &mut current_lines);
 
     messages
 }
