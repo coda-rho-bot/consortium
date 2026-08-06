@@ -1238,10 +1238,29 @@ class Consortium:
             self.log(f"  {name} reflection error: {e}")
 
     def _cleanup_status(self):
-        """Remove status file when consortium ends."""
+        """Remove status file when consortium ends, plus any stale ones."""
         try:
             os.remove(STATUS_FILE)
         except FileNotFoundError:
+            pass
+        # Clean up stale status files from crashed/killed consortium processes
+        try:
+            if os.path.isdir(STATUS_DIR):
+                for f in os.listdir(STATUS_DIR):
+                    if not f.endswith('.json'):
+                        continue
+                    fpath = os.path.join(STATUS_DIR, f)
+                    try:
+                        pid = int(f.replace('.json', ''))
+                        # Check if process exists (signal 0 = exists, raises if not)
+                        os.kill(pid, 0)
+                    except (ValueError, ProcessLookupError, PermissionError):
+                        # Stale — PID doesn't exist or we can't signal it
+                        try:
+                            os.remove(fpath)
+                        except FileNotFoundError:
+                            pass
+        except Exception:
             pass
 
     def save_transcript(self):
