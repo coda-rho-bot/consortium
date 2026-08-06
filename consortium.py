@@ -1100,8 +1100,13 @@ class Consortium:
         self.log(f"\nConsortium ended. {msg_count} messages.")
         if self.transcript_path:
             self.log(f"Transcript: {self.transcript_path}")
-        # Write final status with ended_at before cleanup
+        # Write final status with ended_at and KEEP it for 10 seconds
+        # so the TUI can display the ended state, then clean up
         self._write_status()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            pass
         self._cleanup_status()
 
     def extract_commitments(self):
