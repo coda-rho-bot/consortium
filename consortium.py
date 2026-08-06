@@ -39,7 +39,8 @@ import re
 import sys
 import time
 
-STATUS_FILE = os.path.expanduser("~/.consortium-status.json")
+STATUS_DIR = os.path.expanduser("~/.consortium-status")
+STATUS_FILE = os.path.join(STATUS_DIR, f"{os.getpid()}.json")
 from datetime import datetime
 from pathlib import Path
 
@@ -637,6 +638,7 @@ class Consortium:
         self.idle_timeout = idle_timeout
 
         self.agents = [(c["id"], c.get("name", c["id"])) for c in agent_configs]
+        self.agent_models: dict[str, str] = {c["id"]: c.get("model", "unknown") for c in agent_configs}
 
         self.acp_agents: dict[str, ACPAgent] = {}
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
@@ -707,10 +709,13 @@ class Consortium:
     def _write_status(self):
         """Write live status JSON for TUI consumption."""
         import json
+        os.makedirs(STATUS_DIR, exist_ok=True)
         status = {
+            "pid": os.getpid(),
             "topic": self.topic,
             "started_at": self._start_time.isoformat() if self._start_time else "",
             "participants": [name for _, name in self.agents],
+            "participant_models": {name: self.agent_models.get(aid, "unknown") for aid, name in self.agents},
             "max_messages": self.max_messages,
             "status": "ended" if self.ending else "running",
             "current_speakers": list(self._composing),
@@ -1082,6 +1087,9 @@ class Consortium:
         except asyncio.TimeoutError:
             self.log("Reflection phase timed out after 180s. Continuing to shutdown.")
 
+        # Commitment report: scan transcript for "I will" statements
+        self.print_commitment_report()
+
         # H8: parallel agent shutdown
         stop_tasks = [agent.stop() for agent in self.acp_agents.values()]
         if stop_tasks:
@@ -1092,6 +1100,76 @@ class Consortium:
         if self.transcript_path:
             self.log(f"Transcript: {self.transcript_path}")
         self._cleanup_status()
+
+    def extract_commitments(self):
+        """Scan transcript for commitment statements and output a report.
+
+        Looks for patterns like 'I will', 'I'll', 'I commit to', 'I propose to',
+        'Next step', 'Action item' in agent messages.
+        """
+        commitment_patterns = re.compile(
+            r'(?:I will |I\'ll |I commit to |I propose to |I\'m going to |'
+            r'Next step: |Action item: |I need to |I should )',
+            re.IGNORECASE
+        )
+
+        commitments = []
+        for msg in self.transcript:
+            if msg.type != "message":
+                continue
+            for line in msg.text.split('\n'):
+                if commitment_patterns.search(line):
+                    commitments.append({
+                        "agent": msg.sender,
+                        "commitment": line.strip()[:200],
+                    })
+
+        return commitments
+
+    def print_commitment_report(self):
+        """Print a commitment report to console and append to transcript."""
+        commitments = self.extract_commitments()
+
+        if not commitments:
+            self.log("\n--- Commitment Report: No commitments detected ---")
+            return
+
+        self.log(f"\n--- Commitment Report ({len(commitments)} commitments) ---")
+        self.log("Review these in agent memories to verify execution.")
+        self.log("")
+
+        by_agent = {}
+        for c in commitments:
+            by_agent.setdefault(c["agent"], []).append(c["commitment"])
+
+        for agent, items in by_agent.items():
+            self.log(f"  [{agent}] ({len(items)} commitments)")
+            for item in items:
+                self.log(f"    • {item}")
+
+        # Also append to transcript
+        lines = ["\n--- Commitment Report ---"]
+        lines.append(f"Total commitments detected: {len(commitments)}")
+        lines.append("Verify execution by checking each agent's memory git log.\n")
+        for agent, items in by_agent.items():
+            lines.append(f"**[{agent}]** ({len(items)} commitments)")
+            for item in items:
+                lines.append(f"- {item}")
+            lines.append("")
+
+        # Re-save transcript with commitment report appended
+        try:
+            if self.transcript_path and self.transcript_path.exists():
+                current = self.transcript_path.read_text(encoding="utf-8")
+                # Insert before the last "---" (ended marker)
+                report = "\n".join(lines)
+                if "**Ended:**" in current:
+                    current = current.replace("**Ended:**", report + "\n---\n**Ended:**")
+                else:
+                    current += "\n" + report
+                self.transcript_path.write_text(current, encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: could not append commitment report: {e}", file=sys.stderr)
 
     async def reflection_phase(self):
         """Give each agent the full transcript to reflect on."""
@@ -1116,8 +1194,11 @@ class Consortium:
             f"Total messages: {sum(1 for m in self.transcript if m.type == 'message')}\n\n"
             f"Take a moment to reflect on this discussion. You can:\n"
             f"- Update your memory with anything important that was discussed\n"
-            f"- Note any decisions, action items, or follow-ups for yourself\n"
-            f"- Run any tools or commands you need to\n\n"
+            f"- Run any tools or commands you need to\n"
+            f"- DO any work you committed to during the discussion\n\n"
+            f"IMPORTANT — Commitment accountability:\n"
+            f"If you said 'I will do X' or 'I'll fix Y' during this consortium, DO IT NOW.\n"
+            f"Do not promise to do it later. Execute during this reflection time.\n\n"
             f"There is no need to respond to the group. This is your personal reflection time.\n"
             f"Simply acknowledge when you're done (one sentence)."
         )
@@ -1174,7 +1255,7 @@ class Consortium:
             start_str = self._start_time.strftime('%Y-%m-%d %H:%M:%S') if self._start_time else now_str  # L2
             lines = [
                 f"# Consortium: {self.topic}",
-                f"**Participants:** {', '.join(name for _, name in self.agents)}",
+                f"**Participants:** {', '.join(f'{name} ({model})' for aid, name in self.agents for model in [self.agent_models.get(aid, 'unknown')])}",
                 f"**Transport:** ACP (raw JSON-RPC over stdio)",
                 f"**Started:** {start_str}",  # L2: use actual start time
                 f"**Max messages per agent:** {self.max_messages}",
@@ -1231,6 +1312,8 @@ Examples:
                         help="Maximum number of consortium cycles (default: 100, safety valve)")
     parser.add_argument("--idle-timeout", type=int, default=30,
                         help="Seconds of silence before ending (event-driven mode, default: 30)")
+    parser.add_argument("--action-mode", action="store_true",
+                        help="Action mode: prepends instructions requiring agents to DO work during the session, not promise to do it later")
     args = parser.parse_args()
 
     # M5: validate args
@@ -1275,7 +1358,20 @@ Examples:
             print(f"Warning: duplicate agent ID '{lower_id}' — ignoring", file=sys.stderr)
     agent_configs = unique_configs
 
-    c = Consortium(args.topic, agent_configs, args.max_messages,
+    # Action mode: prepend execution instructions to the topic
+    topic = args.topic
+    if args.action_mode:
+        topic = (
+            "ACTION MODE — DO work during this consortium, do NOT promise to do it later.\n\n"
+            "Rules:\n"
+            "- If you propose a change, MAKE IT during the consortium (run the command, edit the file)\n"
+            "- If you can't make it during the consortium, say explicitly 'CANNOT DO NOW — requires X'\n"
+            "- Do not say 'I will do X later' — either do it now or declare the blocker\n"
+            "- Report concrete results: commit hashes, file paths, HTTP codes, command output\n\n"
+            f"Topic:\n{args.topic}"
+        )
+
+    c = Consortium(topic, agent_configs, args.max_messages,
                    args.initiator, args.interactive, args.timeout,
                    unsafe=args.unsafe, max_cycles=args.max_cycles,
                    idle_timeout=args.idle_timeout)
