@@ -1117,6 +1117,8 @@ class Consortium:
         for msg in self.transcript:
             if msg.type != "message":
                 continue
+            if msg.sender == "Human" or msg.sender == self.initiator:
+                continue  # Don't scan human/integrator messages
             for line in msg.text.split('\n'):
                 if commitment_patterns.search(line):
                     commitments.append({
