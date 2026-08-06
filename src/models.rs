@@ -9,6 +9,7 @@ pub struct Transcript {
     pub path: PathBuf,
     pub filename: String,
     pub timestamp: Option<DateTime<Local>>,
+    pub ended_at: Option<String>,
     pub topic: String,
     pub participants: Vec<String>,
     pub max_messages: usize,
@@ -55,6 +56,7 @@ impl Transcript {
             .unwrap_or_default();
 
         let timestamp = parse_timestamp_from_filename(&filename);
+        let ended_at = parse_ended_at(&raw);
         let topic = parse_topic(&raw);
         let participants = parse_participants(&raw);
         let max_messages = parse_max_messages(&raw);
@@ -64,6 +66,7 @@ impl Transcript {
             path: path.to_path_buf(),
             filename,
             timestamp,
+            ended_at,
             topic,
             participants,
             max_messages,
@@ -147,6 +150,16 @@ fn parse_timestamp_from_filename(filename: &str) -> Option<DateTime<Local>> {
         let datetime_str = format!("{}-{}", parts[0], parts[1]);
         if let Ok(dt) = NaiveDateTime::parse_from_str(&datetime_str, "%Y%m%d-%H%M%S") {
             return Some(dt.and_utc().with_timezone(&Local));
+        }
+    }
+    None
+}
+
+fn parse_ended_at(raw: &str) -> Option<String> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("**Ended:**") {
+            return Some(trimmed["**Ended:**".len()..].trim().to_string());
         }
     }
     None
