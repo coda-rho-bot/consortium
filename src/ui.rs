@@ -235,6 +235,13 @@ fn build_preview(t: &Transcript) -> Text {
         Span::raw(t.messages.len().to_string()),
     ]));
 
+    if let Some(ended) = &t.ended_at {
+        lines.push(Line::from(vec![
+            Span::styled("Ended: ", Style::default().fg(Color::Yellow)),
+            Span::raw(ended),
+        ]));
+    }
+
     lines.push(Line::from(""));
 
     // Show first 15 messages
@@ -308,6 +315,12 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
         Span::styled("Total messages: ", Style::default().fg(Color::Yellow)),
         Span::raw(transcript.messages.len().to_string()),
     ]));
+    if let Some(ended) = &transcript.ended_at {
+        lines.push(Line::from(vec![
+            Span::styled("Ended:          ", Style::default().fg(Color::Yellow)),
+            Span::raw(ended),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("File:           ", Style::default().fg(Color::Yellow)),
         Span::raw(transcript.filename.clone()),
