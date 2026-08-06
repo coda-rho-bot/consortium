@@ -714,6 +714,7 @@ class Consortium:
             "pid": os.getpid(),
             "topic": self.topic,
             "started_at": self._start_time.isoformat() if self._start_time else "",
+            "ended_at": datetime.now().isoformat() if self.ending else "",
             "participants": [name for _, name in self.agents],
             "participant_models": {name: self.agent_models.get(aid, "unknown") for aid, name in self.agents},
             "max_messages": self.max_messages,
@@ -1099,6 +1100,8 @@ class Consortium:
         self.log(f"\nConsortium ended. {msg_count} messages.")
         if self.transcript_path:
             self.log(f"Transcript: {self.transcript_path}")
+        # Write final status with ended_at before cleanup
+        self._write_status()
         self._cleanup_status()
 
     def extract_commitments(self):
