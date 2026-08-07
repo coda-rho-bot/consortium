@@ -3,7 +3,7 @@ mod ui;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle},
     execute,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     // Set terminal window title
-    execute!(stdout, crossterm::terminal::SetTitle("Consortium ACP"))?;
+    execute!(stdout, SetTitle("Consortium ACP"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -37,11 +37,16 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
+    let mut last_transcript_refresh = std::time::Instant::now();
 
     loop {
-        // Check for live consortium status every render in live mode
-        if app.view_mode == ViewMode::Live {
-            app.refresh_live();
+        // Auto-refresh live statuses every iteration (throttled to 1/sec internally)
+        app.refresh_live();
+
+        // Auto-refresh transcript list every 5 seconds (picks up new consortiums)
+        if last_transcript_refresh.elapsed() >= Duration::from_secs(5) {
+            app.transcripts = models::Transcript::load_all();
+            last_transcript_refresh = std::time::Instant::now();
         }
 
         terminal.draw(|frame| ui::render(&mut app, frame))?;
@@ -55,10 +60,10 @@ fn run_app(
 
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        if app.view_mode == ViewMode::History {
-                            break;
-                        } else {
-                            app.back();
+                        match app.view_mode {
+                            ViewMode::History => break,
+                            ViewMode::Live => app.view_mode = ViewMode::LiveList,
+                            _ => app.back(),
                         }
                     }
                     KeyCode::Char('h') => {
@@ -68,26 +73,30 @@ fn run_app(
                         app.toggle_live();
                     }
                     KeyCode::Char('r') => {
-                        // Refresh transcript list
                         app.transcripts = models::Transcript::load_all();
                     }
                     KeyCode::Down | KeyCode::Char('j') => match app.view_mode {
                         ViewMode::History => app.next(),
+                        ViewMode::LiveList => app.live_next(),
                         ViewMode::Transcript => app.scroll_down(),
-                        ViewMode::Live => {}
+                        ViewMode::Live => app.scroll_down(),
                     },
                     KeyCode::Up | KeyCode::Char('k') => match app.view_mode {
                         ViewMode::History => app.previous(),
+                        ViewMode::LiveList => app.live_previous(),
                         ViewMode::Transcript => app.scroll_up(),
-                        ViewMode::Live => {}
+                        ViewMode::Live => app.scroll_up(),
                     },
                     KeyCode::PageDown => {
                         match app.view_mode {
                             ViewMode::History => {
                                 for _ in 0..5 { app.next(); }
                             }
+                            ViewMode::LiveList => {
+                                for _ in 0..5 { app.live_next(); }
+                            }
                             ViewMode::Transcript => app.scroll_page_down(20),
-                            _ => {}
+                            ViewMode::Live => app.scroll_page_down(20),
                         }
                     }
                     KeyCode::PageUp => {
@@ -95,30 +104,42 @@ fn run_app(
                             ViewMode::History => {
                                 for _ in 0..5 { app.previous(); }
                             }
+                            ViewMode::LiveList => {
+                                for _ in 0..5 { app.live_previous(); }
+                            }
                             ViewMode::Transcript => app.scroll_page_up(20),
-                            _ => {}
+                            ViewMode::Live => app.scroll_page_up(20),
                         }
                     }
                     KeyCode::Home => match app.view_mode {
-                        ViewMode::Transcript => app.scroll_to_top(),
+                        ViewMode::Transcript | ViewMode::Live => app.scroll_to_top(),
                         ViewMode::History => {
                             app.list_state.select(Some(0));
                             app.scroll = 0;
                         }
-                        _ => {}
+                        ViewMode::LiveList => {
+                            if !app.live_statuses.is_empty() {
+                                app.live_list_state.select(Some(0));
+                            }
+                        }
                     },
                     KeyCode::End => match app.view_mode {
-                        ViewMode::Transcript => app.scroll_to_bottom(),
+                        ViewMode::Transcript | ViewMode::Live => app.scroll_to_bottom(),
                         ViewMode::History => {
                             if !app.transcripts.is_empty() {
                                 app.list_state.select(Some(app.transcripts.len() - 1));
                                 app.scroll = 0;
                             }
                         }
-                        _ => {}
+                        ViewMode::LiveList => {
+                            if !app.live_statuses.is_empty() {
+                                app.live_list_state.select(Some(app.live_statuses.len() - 1));
+                            }
+                        }
                     },
                     KeyCode::Enter => match app.view_mode {
                         ViewMode::History => app.open_transcript(),
+                        ViewMode::LiveList => app.open_live(),
                         _ => {}
                     },
                     KeyCode::Backspace => {
