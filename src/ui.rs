@@ -16,14 +16,17 @@ pub struct App {
     pub view_mode: ViewMode,
     pub scroll: usize,
     pub max_scroll: usize,
-    pub live_status: Option<ConsortiumStatus>,
+    pub live_statuses: Vec<(String, ConsortiumStatus)>,
+    pub live_list_state: ListState,
     pub live_last_check: std::time::Instant,
+    pub live_user_scrolled: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     History,
     Transcript,
+    LiveList,
     Live,
 }
 
@@ -42,8 +45,10 @@ impl App {
             view_mode: ViewMode::History,
             scroll: 0,
             max_scroll: 0,
-            live_status: None,
+            live_statuses: Vec::new(),
+            live_list_state: ListState::default(),
             live_last_check: std::time::Instant::now(),
+            live_user_scrolled: false,
         }
     }
 
@@ -53,12 +58,19 @@ impl App {
             .and_then(|i| self.transcripts.get(i))
     }
 
+    pub fn current_live(&self) -> Option<&ConsortiumStatus> {
+        self.live_list_state
+            .selected()
+            .and_then(|i| self.live_statuses.get(i))
+            .map(|(_, s)| s)
+    }
+
     pub fn refresh_live(&mut self) {
         if self.live_last_check.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
         self.live_last_check = std::time::Instant::now();
-        self.live_status = ConsortiumStatus::load_live();
+        self.live_statuses = ConsortiumStatus::load_all_live();
     }
 
     pub fn next(&mut self) {
@@ -83,6 +95,26 @@ impl App {
         self.scroll = 0;
     }
 
+    pub fn live_next(&mut self) {
+        if self.live_statuses.is_empty() {
+            return;
+        }
+        let i = self.live_list_state.selected().map_or(0, |i| {
+            (i + 1).min(self.live_statuses.len() - 1)
+        });
+        self.live_list_state.select(Some(i));
+    }
+
+    pub fn live_previous(&mut self) {
+        if self.live_statuses.is_empty() {
+            return;
+        }
+        let i = self.live_list_state
+            .selected()
+            .map_or(0, |i| if i == 0 { 0 } else { i - 1 });
+        self.live_list_state.select(Some(i));
+    }
+
     pub fn open_transcript(&mut self) {
         if self.current_transcript().is_some() {
             self.view_mode = ViewMode::Transcript;
@@ -90,40 +122,72 @@ impl App {
         }
     }
 
+    pub fn open_live(&mut self) {
+        if self.live_list_state.selected().is_some() {
+            self.view_mode = ViewMode::Live;
+            self.scroll = 0;
+            self.live_user_scrolled = false;
+        }
+    }
+
     pub fn scroll_down(&mut self) {
         self.scroll = self.scroll.saturating_add(1).min(self.max_scroll);
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = true;
+        }
     }
 
     pub fn scroll_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(1);
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = true;
+        }
     }
 
     pub fn scroll_page_down(&mut self, page_size: usize) {
         self.scroll = self.scroll.saturating_add(page_size).min(self.max_scroll);
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = true;
+        }
     }
 
     pub fn scroll_page_up(&mut self, page_size: usize) {
         self.scroll = self.scroll.saturating_sub(page_size);
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = true;
+        }
     }
 
     pub fn scroll_to_top(&mut self) {
         self.scroll = 0;
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = true;
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = self.max_scroll;
+        if self.view_mode == ViewMode::Live {
+            self.live_user_scrolled = false;
+        }
     }
 
     pub fn back(&mut self) {
-        self.view_mode = ViewMode::History;
+        match self.view_mode {
+            ViewMode::Live => self.view_mode = ViewMode::LiveList,
+            _ => self.view_mode = ViewMode::History,
+        }
     }
 
     pub fn toggle_live(&mut self) {
         match self.view_mode {
-            ViewMode::Live => self.view_mode = ViewMode::History,
+            ViewMode::LiveList | ViewMode::Live => self.view_mode = ViewMode::History,
             _ => {
-                self.view_mode = ViewMode::Live;
+                self.view_mode = ViewMode::LiveList;
                 self.refresh_live();
+                if !self.live_statuses.is_empty() {
+                    self.live_list_state.select(Some(0));
+                }
             }
         }
     }
@@ -132,7 +196,6 @@ impl App {
 pub fn render(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
 
-    // Main layout: content + status bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -141,6 +204,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     match app.view_mode {
         ViewMode::History => render_history(app, frame, chunks[0]),
         ViewMode::Transcript => render_transcript_viewer(app, frame, chunks[0]),
+        ViewMode::LiveList => render_live_list(app, frame, chunks[0]),
         ViewMode::Live => render_live(app, frame, chunks[0]),
     }
 
@@ -153,7 +217,6 @@ fn render_history(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Left: transcript list
     let items: Vec<ListItem> = app
         .transcripts
         .iter()
@@ -193,7 +256,6 @@ fn render_history(app: &mut App, frame: &mut Frame, area: Rect) {
 
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
 
-    // Right: preview of selected transcript
     if let Some(t) = app.current_transcript() {
         let preview = build_preview(t);
         let para = Paragraph::new(preview)
@@ -212,7 +274,7 @@ fn render_history(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn build_preview(t: &Transcript) -> Text {
+fn build_preview(t: &Transcript) -> Text<'_> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(vec![
@@ -244,7 +306,6 @@ fn build_preview(t: &Transcript) -> Text {
 
     lines.push(Line::from(""));
 
-    // Show first 15 messages
     for msg in t.messages.iter().take(15) {
         if msg.is_system {
             lines.push(Line::from(Span::styled(
@@ -290,7 +351,6 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // ── Full details header ──
     lines.push(Line::from(Span::styled(
         &transcript.topic,
         Style::default()
@@ -331,7 +391,6 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
     )));
     lines.push(Line::from(""));
 
-    // ── Messages (let ratatui handle all wrapping) ──
     for msg in &transcript.messages {
         if msg.is_system {
             lines.push(Line::from(Span::styled(
@@ -345,7 +404,6 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
             )));
         } else {
             let color = sender_color(&msg.sender);
-            // Split multi-line messages into separate Line objects
             for (i, line_text) in msg.text.lines().enumerate() {
                 if i == 0 {
                     lines.push(Line::from(vec![
@@ -359,7 +417,6 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
                     lines.push(Line::from(Span::raw(line_text.to_string())));
                 }
             }
-            // If message was empty after stripping, still show the sender
             if msg.text.lines().count() == 0 {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -369,10 +426,9 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
                 ]));
             }
         }
-        lines.push(Line::from("")); // spacing between messages
+        lines.push(Line::from(""));
     }
 
-    // ── Compute scroll bounds (accounting for text wrapping) ──
     let content_width = area.width.saturating_sub(2) as usize;
     let content_height = area.height.saturating_sub(2) as usize;
     let total_visual = count_visual_lines(&lines, content_width);
@@ -392,36 +448,99 @@ fn render_transcript_viewer(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_live_list(app: &mut App, frame: &mut Frame, area: Rect) {
+    app.refresh_live();
+
+    if app.live_statuses.is_empty() {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No consortiums running.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Start one with:"),
+            Line::from(Span::styled(
+                "  python3 ~/dev/infra/consortium/consortium.py --topic \"...\" --config agents.yaml",
+                Style::default().fg(Color::Green),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press L to refresh, H for history",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Live Consortiums ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        frame.render_widget(para, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .live_statuses
+        .iter()
+        .map(|(_, status)| {
+            let msg_count = status.messages.len();
+            let is_running = status.status == "running";
+            let indicator = if is_running { "●" } else { "○" };
+            let indicator_color = if is_running { Color::Green } else { Color::DarkGray };
+            let speakers = if !is_running {
+                " (ended)".to_string()
+            } else if status.current_speakers.is_empty() {
+                String::new()
+            } else {
+                format!(" ▶ {}", status.current_speakers.join(", "))
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", indicator),
+                    Style::default().fg(indicator_color),
+                ),
+                Span::raw(status.topic.chars().take(60).collect::<String>()),
+                Span::styled(
+                    format!(" ({} msgs){}", msg_count, speakers),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Live Consortiums ({}) ", app.live_statuses.len()))
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .scroll_padding(3);
+
+    frame.render_stateful_widget(list, area, &mut app.live_list_state);
+}
+
 fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
     app.refresh_live();
 
-    let status = match &app.live_status {
-        Some(s) => s,
+    let status = match app.current_live() {
+        Some(s) => s.clone(),
         None => {
-            let para = Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "No consortium in progress.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from("Start one with:"),
-                Line::from(Span::styled(
-                    "  python3 ~/dev/infra/consortium/consortium.py --topic \"...\" --config agents.yaml",
-                    Style::default().fg(Color::Green),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Press L to check again, H for history",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Live Consortium ")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            );
+            let para = Paragraph::new("No consortium selected. Press Backspace to go back.")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Live Consortium ")
+                        .border_style(Style::default().fg(Color::Red)),
+                );
             frame.render_widget(para, area);
             return;
         }
@@ -429,7 +548,6 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header
     lines.push(Line::from(Span::styled(
         &status.topic,
         Style::default()
@@ -441,7 +559,7 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
         format!(
             "Started: {} | Participants: {} | Status: {}",
             status.started_at,
-            status.participants.join(", "),
+            status.display_participants(),
             status.status
         ),
         Style::default().fg(Color::DarkGray),
@@ -461,7 +579,6 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
 
     lines.push(Line::from(""));
 
-    // Messages
     for msg in &status.messages {
         let color = sender_color(&msg.sender);
 
@@ -476,29 +593,40 @@ fn render_live(app: &mut App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("[{}]: ", msg.sender),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(&msg.text),
-            ]));
+            for (i, line_text) in msg.text.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("[{}]: ", msg.sender),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(line_text.to_string()),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::raw(line_text.to_string())));
+                }
+            }
         }
         lines.push(Line::from(""));
     }
 
-    // Auto-scroll to bottom for live view
     let content_width = area.width.saturating_sub(2) as usize;
     let content_height = area.height.saturating_sub(2) as usize;
     let total_visual = count_visual_lines(&lines, content_width);
     app.max_scroll = total_visual.saturating_sub(content_height);
-    app.scroll = app.max_scroll;
+
+    // Auto-scroll to bottom unless user has manually scrolled up
+    if !app.live_user_scrolled {
+        app.scroll = app.max_scroll;
+    } else {
+        app.scroll = app.scroll.min(app.max_scroll);
+    }
 
     let para = Paragraph::new(Text::from(lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Live Consortium ({} msgs) ", status.messages.len()))
+                .title(format!(" Live ({} msgs) ", status.messages.len()))
                 .border_style(Style::default().fg(Color::Green)),
         )
         .wrap(Wrap { trim: false })
@@ -511,18 +639,20 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let mode_text = match app.view_mode {
         ViewMode::History => "HISTORY",
         ViewMode::Transcript => "TRANSCRIPT",
+        ViewMode::LiveList => "LIVE LIST",
         ViewMode::Live => "LIVE",
     };
 
-    let live_indicator = if app.live_status.is_some() {
-        " ● LIVE"
+    let live_count = app.live_statuses.iter().filter(|(_, s)| s.status == "running").count();
+    let live_indicator = if live_count > 0 {
+        format!(" ● {} live", live_count)
     } else {
-        ""
+        String::new()
     };
 
     let scroll_indicator = match app.view_mode {
         ViewMode::Transcript | ViewMode::Live if app.max_scroll > 0 => {
-            let pct = if app.max_scroll == 0 { 0 } else { app.scroll * 100 / app.max_scroll };
+            let pct = app.scroll * 100 / app.max_scroll;
             let label = if app.scroll == 0 {
                 "Top".to_string()
             } else if app.scroll >= app.max_scroll {
@@ -530,12 +660,11 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
             } else {
                 format!("{}%", pct)
             };
-            // 10-segment progress bar
             let filled = (pct as f64 / 10.0).round() as usize;
-            let bar: String = "█".repeat(filled.min(10)) + &"░".repeat(10 - filled.min(10));
-            format!(" ▏{}▕ {} ", bar, label)
+            let bar: String = "\u{2588}".repeat(filled.min(10)) + &"\u{2591}".repeat(10 - filled.min(10));
+            format!(" \u{258F}{}\u{258F} {} ", bar, label)
         },
-        ViewMode::Transcript | ViewMode::Live => " ▏ All ▏ ".to_string(),
+        ViewMode::Transcript | ViewMode::Live => " \u{258F} All \u{258F} ".to_string(),
         _ => String::new(),
     };
 
@@ -552,6 +681,8 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(scroll_indicator, Style::default().fg(Color::Yellow)),
         Span::raw(" │ "),
         Span::styled("↑↓ navigate", Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled("Enter open", Style::default().fg(Color::DarkGray)),
         Span::raw(" "),
         Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
         Span::raw(" "),

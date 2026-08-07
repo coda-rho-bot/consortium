@@ -36,6 +36,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import sys
 import time
 
@@ -982,6 +983,16 @@ class Consortium:
                 break
 
     async def run(self):
+        # Register signal handler to clean up status file on SIGTERM/SIGINT
+        def _signal_cleanup(signum, frame):
+            self.ending = True
+            self._cleanup_status()
+            sys.exit(1)
+        signal.signal(signal.SIGTERM, _signal_cleanup)
+
+        # Clean up any stale status files from previous crashed consortiums
+        self._cleanup_status()
+
         await self.setup()
 
         if not self.active:

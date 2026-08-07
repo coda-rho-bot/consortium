@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ pub struct Transcript {
     pub ended_at: Option<String>,
     pub topic: String,
     pub participants: Vec<String>,
+    pub participant_models: HashMap<String, String>,
     pub max_messages: usize,
     pub messages: Vec<TranscriptMessage>,
     pub raw_markdown: String,
@@ -58,7 +60,7 @@ impl Transcript {
         let timestamp = parse_timestamp_from_filename(&filename);
         let ended_at = parse_ended_at(&raw);
         let topic = parse_topic(&raw);
-        let participants = parse_participants(&raw);
+        let (participants, participant_models) = parse_participants(&raw);
         let max_messages = parse_max_messages(&raw);
         let messages = parse_messages(&raw);
 
@@ -69,6 +71,7 @@ impl Transcript {
             ended_at,
             topic,
             participants,
+            participant_models,
             max_messages,
             messages,
             raw_markdown: raw,
@@ -96,7 +99,14 @@ impl Transcript {
         if self.participants.is_empty() {
             "?".to_string()
         } else {
-            self.participants.join(", ")
+            self.participants
+                .iter()
+                .map(|name| match self.participant_models.get(name) {
+                    Some(model) => format!("{} ({})", name, model),
+                    None => name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     }
 }
@@ -104,12 +114,21 @@ impl Transcript {
 /// Live consortium status
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConsortiumStatus {
+    #[serde(default)]
+    pub pid: Option<u32>,
     pub topic: String,
+    #[serde(default)]
     pub started_at: String,
     pub participants: Vec<String>,
+    #[serde(default)]
+    pub participant_models: HashMap<String, String>,
+    #[serde(default)]
     pub max_messages: usize,
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub messages: Vec<StatusMessage>,
+    #[serde(default)]
     pub current_speakers: Vec<String>,
 }
 
@@ -117,19 +136,89 @@ pub struct ConsortiumStatus {
 pub struct StatusMessage {
     pub sender: String,
     pub text: String,
+    #[serde(default)]
     pub timestamp: String,
+    #[serde(default)]
     pub msg_type: String,
 }
 
 impl ConsortiumStatus {
-    pub fn load_live() -> Option<ConsortiumStatus> {
-        let path = status_file_path();
-        if !path.exists() {
-            return None;
+    /// Load all live consortium statuses.
+    /// Scans ~/.consortium-status/*.json (PID-based, new format)
+    /// and ~/.consortium-status.json (legacy single file).
+    /// Filters out stale entries where the PID is no longer alive.
+    pub fn load_all_live() -> Vec<(String, ConsortiumStatus)> {
+        let mut results = Vec::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/rhomancer".to_string());
+
+        // New format: ~/.consortium-status/*.json (PID-based filenames)
+        let status_dir = PathBuf::from(&home).join(".consortium-status");
+        if status_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&status_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "json") {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            if let Ok(status) = serde_json::from_str::<ConsortiumStatus>(&content) {
+                                let id = path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+
+                                // Check if the PID is still alive (stale detection)
+                                if let Some(pid) = status.pid {
+                                    if !pid_exists(pid as i32) {
+                                        // Process is dead — skip stale entry
+                                        // (cleanup happens in consortium.py on next start)
+                                        continue;
+                                    }
+                                }
+
+                                results.push((id, status));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        match fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).ok(),
-            Err(_) => None,
+
+        // Legacy fallback: ~/.consortium-status.json (single file)
+        let legacy = PathBuf::from(&home).join(".consortium-status.json");
+        if legacy.exists() {
+            if let Ok(content) = fs::read_to_string(&legacy) {
+                if let Ok(status) = serde_json::from_str::<ConsortiumStatus>(&content) {
+                    results.push(("legacy".to_string(), status));
+                }
+            }
+        }
+
+        // Sort: running first, then ended
+        results.sort_by(|a, b| {
+            let a_running = a.1.status == "running";
+            let b_running = b.1.status == "running";
+            b_running.cmp(&a_running)
+        });
+
+        results
+    }
+
+    pub fn display_participants(&self) -> String {
+        if self.participants.is_empty() {
+            "?".to_string()
+        } else {
+            self.participants
+                .iter()
+                .map(|name| {
+                    let model = self.participant_models.get(name);
+                    match model {
+                        Some(m) if m != "unknown" && !m.is_empty() => {
+                            format!("{} ({})", name, m)
+                        }
+                        _ => name.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         }
     }
 }
@@ -139,9 +228,10 @@ fn dirs() -> PathBuf {
         .join("consortium-transcripts")
 }
 
-pub fn status_file_path() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/home/rhomancer".to_string()))
-        .join(".consortium-status.json")
+/// Check if a process with the given PID exists.
+/// Uses libc::kill(pid, 0) which returns 0 if the process exists.
+fn pid_exists(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn parse_timestamp_from_filename(filename: &str) -> Option<DateTime<Local>> {
@@ -175,18 +265,38 @@ fn parse_topic(raw: &str) -> String {
     "Untitled".to_string()
 }
 
-fn parse_participants(raw: &str) -> Vec<String> {
+/// Parse participants, extracting model info from "Name (model)" format.
+fn parse_participants(raw: &str) -> (Vec<String>, HashMap<String, String>) {
+    let mut participants = Vec::new();
+    let mut models = HashMap::new();
     for line in raw.lines() {
         if line.starts_with("**Participants:**") {
             let rest = &line["**Participants:**".len()..];
-            return rest
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            for part in rest.split(',') {
+                let part = part.trim();
+                // Check for "Name (model)" format
+                if let Some(open) = part.rfind('(') {
+                    if let Some(close) = part.rfind(')') {
+                        if close > open {
+                            let name = part[..open].trim().to_string();
+                            let model = part[open + 1..close].trim().to_string();
+                            if !name.is_empty() {
+                                participants.push(name.clone());
+                                models.insert(name, model);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // No model specified
+                if !part.is_empty() {
+                    participants.push(part.to_string());
+                }
+            }
+            break;
         }
     }
-    Vec::new()
+    (participants, models)
 }
 
 fn parse_max_messages(raw: &str) -> usize {
@@ -251,12 +361,11 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
         }
     };
 
-    // Pre-scan: find the line index of the final --- separator (the one before **Ended:**)
+    // Pre-scan: find the line index of the final --- separator
     let lines: Vec<&str> = raw.lines().collect();
     let mut end_separator_idx: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
         if line.trim().starts_with("**Ended:**") {
-            // Walk backwards to find the --- before this
             for j in (0..i).rev() {
                 if lines[j].trim().starts_with("---") {
                     end_separator_idx = Some(j);
@@ -266,7 +375,6 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
             break;
         }
     }
-    // Fallback: if no **Ended:** found, use the last --- in the file
     if end_separator_idx.is_none() {
         for (i, line) in lines.iter().enumerate().rev() {
             if line.trim().starts_with("---") {
@@ -279,9 +387,7 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
 
-        // Detect first --- separator (start of messages section)
         if trimmed.starts_with("---") && !in_messages {
-            // Flush any pre-message content
             flush(&mut messages, &mut current_sender, &mut current_lines);
             in_messages = true;
             continue;
@@ -291,7 +397,6 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
             continue;
         }
 
-        // End of messages section: this --- is the final separator
         if trimmed.starts_with("---") && in_messages {
             if let Some(end_idx) = end_separator_idx {
                 if idx == end_idx {
@@ -299,19 +404,15 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
                     break;
                 }
             }
-            // Otherwise, this --- is inside an agent message — treat as continuation
             if current_sender.is_some() {
                 current_lines.push(line.to_string());
             }
             continue;
         }
 
-        // New message starts with **[Sender]**
         if trimmed.starts_with("**[") {
-            // Flush previous message
             flush(&mut messages, &mut current_sender, &mut current_lines);
 
-            // Parse sender from **[Sender]**
             if let Some(end_bracket) = trimmed.find("]**") {
                 let raw_sender = &trimmed[3..end_bracket];
                 let sender = resolve_name(raw_sender);
@@ -325,13 +426,11 @@ fn parse_messages(raw: &str) -> Vec<TranscriptMessage> {
             continue;
         }
 
-        // Continuation line for current message
         if current_sender.is_some() {
             current_lines.push(line.to_string());
         }
     }
 
-    // Flush last message
     flush(&mut messages, &mut current_sender, &mut current_lines);
 
     messages
