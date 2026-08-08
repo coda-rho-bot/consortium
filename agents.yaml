@@ -1,0 +1,61 @@
+agents:
+  - id: coda
+    name: Coda
+    model: letta/glm
+    command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
+    args: ["--yolo"]
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-b499137a-e1dd-4427-b9df-73e87adfce9e
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:14601
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/rhomancer
+
+  - id: angus
+    name: Angus
+    model: letta/glm
+    timeout: 600
+    command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
+    args: ["--yolo"]
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-c51de213-2275-4d1d-9ed4-8ccfb7047e52
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:14602
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/rhomancer
+
+  - id: beacon
+    name: Beacon
+    model: letta/glm
+    command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
+    args: ["--yolo"]
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-e6f1a549-e06c-4510-b8ea-506f0ebbd211
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:14603
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/rhomancer
+
+  - id: forge
+    name: FORGE
+    model: letta/glm
+    command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
+    args: ["--yolo"]
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-2ee946fb-e74c-4628-9d9a-705fa567afb3
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:14604
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/rhomancer
+
+  - id: sinter
+    name: Sinter
+    model: letta/glm
+    command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
+    args: ["--yolo"]
+    env:
+      LETTA_ACP_BACKEND: remote
+      LETTA_AGENT_ID: agent-5b2254e8-9582-4b39-87be-c9776c958c95
+      LETTA_APP_SERVER_URL: ws://127.0.0.1:14605
+      NODE_OPTIONS: "--experimental-websocket"
+    cwd: /home/rhomancer
