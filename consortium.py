@@ -640,6 +640,7 @@ class Consortium:
 
         self.agents = [(c["id"], c.get("name", c["id"])) for c in agent_configs]
         self.agent_models: dict[str, str] = {c["id"]: c.get("model", "unknown") for c in agent_configs}
+        self.agent_timeouts: dict[str, int] = {c["id"]: c.get("timeout", prompt_timeout) for c in agent_configs}
 
         self.acp_agents: dict[str, ACPAgent] = {}
         self.queues: dict[str, asyncio.Queue] = {aid: asyncio.Queue() for aid, _ in self.agents}
@@ -804,8 +805,9 @@ class Consortium:
                 # Wait for messages — use a long timeout since other agents
                 # may be composing for up to prompt_timeout seconds.
                 # Critical #4: idle_timeout (30s) is too short if agents
-                # are composing (up to 300s). Use prompt_timeout + buffer.
-                queue_wait = max(self.idle_timeout, self.prompt_timeout + 30)
+                # are composing (up to 300s). Use per-agent timeout + buffer.
+                agent_timeout = self.agent_timeouts.get(aid, self.prompt_timeout)
+                queue_wait = max(self.idle_timeout, agent_timeout + 30)
                 # For testing: allow very short queue waits
                 if self.idle_timeout < 5:
                     queue_wait = self.idle_timeout
@@ -858,9 +860,10 @@ class Consortium:
 
                 try:
                     # Design #11: single timeout — prompt() handles its own internal deadline
+                    agent_timeout = self.agent_timeouts.get(aid, self.prompt_timeout)
                     response = await asyncio.wait_for(
-                        agent.prompt(current_prompt, on_event=on_event, timeout=self.prompt_timeout),
-                        timeout=self.prompt_timeout + 5  # Outer timeout slightly longer than inner
+                        agent.prompt(current_prompt, on_event=on_event, timeout=agent_timeout),
+                        timeout=agent_timeout + 5  # Outer timeout slightly longer than inner
                     )
                     sys.stdout.write("\r" + " " * 100 + "\r")
                     sys.stdout.flush()
@@ -1052,10 +1055,15 @@ class Consortium:
                 if all_remaining_passed and idle_seconds > self.idle_timeout:
                     self.log(f"All agents passed and idle for {self.idle_timeout}s. Ending.")
                     break
-                # If not all passed but nobody has messages and nobody is composing,
-                # give it the idle timeout then end
-                if idle_seconds > self.idle_timeout * 2:
-                    self.log(f"Idle for {int(idle_seconds)}s with no activity. Ending.")
+                # Some agents haven't passed — don't end while their tasks
+                # are still running (they may be about to start composing).
+                # Only end if there are truly no waiting agents, or hit hard cap.
+                waiting_agents = [aid for aid in self.active if aid not in self.passed]
+                if not waiting_agents:
+                    break
+                # Hard cap: if idle for 2x prompt_timeout, something is wrong
+                if idle_seconds > self.prompt_timeout * 2:
+                    self.log(f"Hard timeout: {int(idle_seconds)}s idle, agents still waiting: {waiting_agents}")
                     break
 
         self.ending = True
