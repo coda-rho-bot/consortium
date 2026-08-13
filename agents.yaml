@@ -19,7 +19,7 @@ agents:
     args: ["--yolo"]
     env:
       LETTA_ACP_BACKEND: remote
-      LETTA_AGENT_ID: agent-c51de213-2275-4d1d-9ed4-8ccfb7047e52
+      LETTA_AGENT_ID: agent-edc25b5d-5757-4b1f-b533-b8c75f38ba01
       LETTA_APP_SERVER_URL: ws://127.0.0.1:14602
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
@@ -43,7 +43,7 @@ agents:
     args: ["--yolo"]
     env:
       LETTA_ACP_BACKEND: remote
-      LETTA_AGENT_ID: agent-2ee946fb-e74c-4628-9d9a-705fa567afb3
+      LETTA_AGENT_ID: agent-8e405fb7-0bae-4664-86ff-a0b3876b18ce
       LETTA_APP_SERVER_URL: ws://127.0.0.1:14604
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
