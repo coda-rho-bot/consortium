@@ -1027,9 +1027,8 @@ class Consortium:
         if not self.active:
             self.log("No agents available. Exiting.")
             return
-        if len(self.active) < 2:
-            self.log("Need at least 2 active agents. Exiting.")
-            return
+        # Single-agent dispatch mode is valid (consortium.py doubles as a
+        # one-agent action dispatch vehicle via a 1-agent config file).
 
         self._write_status()
         self.log(f"\nStarting consortium: {self.topic}")
@@ -1455,8 +1454,8 @@ Examples:
     for flag in args.agent:
         agent_configs.append(parse_agent_flag(flag))
 
-    if len(agent_configs) < 2:
-        print("Error: need at least 2 agents. Use --config or --agent flags.", file=sys.stderr)
+    if len(agent_configs) < 1:
+        print("Error: need at least 1 agent. Use --config or --agent flags.", file=sys.stderr)
         sys.exit(1)
 
     seen = set()
