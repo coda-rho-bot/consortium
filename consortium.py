@@ -782,6 +782,24 @@ class Consortium:
         )
 
     async def agent_run(self, aid: str):
+        """Isolation wrapper: ANY unexpected failure in an agent's loop marks
+        that agent inactive and logs it — one agent's death never crashes the
+        consortium. The real logic lives in _agent_run_inner."""
+        try:
+            await self._agent_run_inner(aid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.log(f"  {self.name(aid)} agent task failed — isolating: {e}")
+            self.active.discard(aid)
+            self.passed.add(aid)
+            self._composing.discard(aid)
+            try:
+                await self.broadcast(aid, f"(connection failed — removed from conversation)", "pass")
+            except Exception:
+                pass
+
+    async def _agent_run_inner(self, aid: str):
         """Event-driven agent task — runs continuously, processes messages as they arrive.
 
         Unlike the old batch-cycle model, each agent runs independently:
@@ -837,7 +855,7 @@ class Consortium:
             current_prompt = self.first_prompt(aid) if first else self.update_prompt(aid, new_msgs)
             current_draft = None  # The agent's composed response
             recompose_count = 0  # Limit re-compose iterations (prevent livelock)
-            MAX_RECOMPOSE = max(1, len(self.agents) - 1)  # One re-compose per other agent
+            MAX_RECOMPOSE = min(2, max(1, len(self.agents) - 1))  # Cap at 2: recompose cascades amplify token burn under concurrency
 
             while True:
                 if first:
@@ -869,7 +887,12 @@ class Consortium:
                     sys.stdout.flush()
                 except asyncio.TimeoutError:
                     self.log(f"  {name} timed out — PASS")
-                    await agent.cancel_session()
+                    try:
+                        await agent.cancel_session()
+                    except Exception as cancel_err:
+                        # Dead connection — cancel can't be delivered. Agent is
+                        # effectively gone; treat as passed rather than crashing.
+                        self.log(f"  {name}: cancel_session failed ({cancel_err}) — treating as gone")
                     self.passed.add(aid)
                     self._composing.discard(aid)
                     await self.broadcast(aid, "(timed out)", "pass")
@@ -1069,7 +1092,9 @@ class Consortium:
         self.ending = True
         self._write_status()
 
-        # Cancel any still-running agent tasks
+        # Cancel any still-running agent tasks.
+        # A failed agent task (e.g. dead ACP connection) must NEVER crash the
+        # whole consortium — retrieve its exception and continue teardown.
         for aid, task in agent_tasks.items():
             if not task.done():
                 self.log(f"  Waiting for {self.name(aid)} to finish...")
@@ -1077,10 +1102,18 @@ class Consortium:
                     await asyncio.wait_for(task, timeout=10.0)
                 except asyncio.TimeoutError:
                     task.cancel()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as task_err:
+                    self.log(f"  {self.name(aid)} task failed: {task_err}")
+                if not task.done():
+                    task.cancel()
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
+                    except Exception as task_err:
+                        self.log(f"  {self.name(aid)} task teardown error: {task_err}")
 
         human_task.cancel()
         try:
