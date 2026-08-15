@@ -37,6 +37,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -627,7 +628,8 @@ class Consortium:
                  max_messages: int = 5, initiator: str = "Human",
                  interactive: bool = False, prompt_timeout: int = 300,
                  unsafe: bool = False, max_cycles: int = 100,
-                 idle_timeout: int = 30):  # Event-driven: seconds of silence before ending
+                 idle_timeout: int = 30,
+                 keep_conversations: bool = False):  # Event-driven: seconds of silence before ending
         self.topic = topic
         self.agent_configs = agent_configs
         self.max_messages = max_messages
@@ -637,6 +639,7 @@ class Consortium:
         self.unsafe = unsafe  # C3
         self.max_cycles = max_cycles  # M11: kept as safety valve
         self.idle_timeout = idle_timeout
+        self.keep_conversations = keep_conversations
 
         self.agents = [(c["id"], c.get("name", c["id"])) for c in agent_configs]
         self.agent_models: dict[str, str] = {c["id"]: c.get("model", "unknown") for c in agent_configs}
@@ -1143,6 +1146,32 @@ class Consortium:
         # Commitment report: scan transcript for "I will" statements
         self.print_commitment_report()
 
+        # Conversation hygiene: delete the session conversations via the Letta
+        # cloud API (transcript already saved locally). Consortium sessions
+        # accumulate fast — 5 per run — and past ~100 per agent they slow
+        # session/new past the 60s setup timeout (Aug 15 diagnosis).
+        # Curl, not urllib: api.letta.com is behind Cloudflare.
+        if not self.keep_conversations:
+            api_key = os.environ.get("LETTA_API_KEY", "")
+            if api_key:
+                for agent in self.acp_agents.values():
+                    sid = getattr(agent, "session_id", None)
+                    if not sid or not sid.startswith("conv-"):
+                        continue
+                    try:
+                        r = subprocess.run(
+                            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                             "-X", "DELETE", f"https://api.letta.com/v1/conversations/{sid}",
+                             "-H", f"Authorization: Bearer {api_key}"],
+                            capture_output=True, text=True, timeout=30)
+                        if r.stdout in ("200", "204"):
+                            self.log(f"  cleaned conversation {sid[:14]}...")
+                        time.sleep(0.4)
+                    except Exception as e:
+                        self.log(f"  conversation cleanup skipped ({sid[:14]}): {e}")
+            else:
+                self.log("  (LETTA_API_KEY not set — skipping conversation cleanup)")
+
         # H8: parallel agent shutdown
         stop_tasks = [agent.stop() for agent in self.acp_agents.values()]
         if stop_tasks:
@@ -1389,6 +1418,8 @@ Examples:
                         help="Per-agent prompt timeout in seconds (default: 300)")
     parser.add_argument("--unsafe", action="store_true",
                         help="Use unrestricted permissions (agents can run any command without approval)")
+    parser.add_argument("--keep-conversations", action="store_true",
+                        help="Keep session conversations on the Letta server after the run (default: auto-delete — conversation debris slows session starts past ~100 per agent)")
     parser.add_argument("--max-cycles", type=int, default=100,
                         help="Maximum number of consortium cycles (default: 100, safety valve)")
     parser.add_argument("--idle-timeout", type=int, default=30,
@@ -1455,7 +1486,8 @@ Examples:
     c = Consortium(topic, agent_configs, args.max_messages,
                    args.initiator, args.interactive, args.timeout,
                    unsafe=args.unsafe, max_cycles=args.max_cycles,
-                   idle_timeout=args.idle_timeout)
+                   idle_timeout=args.idle_timeout,
+                   keep_conversations=args.keep_conversations)
     asyncio.run(c.run())
 
 
