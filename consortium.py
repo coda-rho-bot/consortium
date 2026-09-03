@@ -700,6 +700,7 @@ class Consortium:
     async def broadcast(self, sender_id: str, text: str, msg_type: str = "message"):
         msg = ConsortiumMessage(self.name(sender_id), text, msg_type)
         self.transcript.append(msg)
+        self.save_transcript()  # Persist every message as it lands
         self._last_activity = time.time()  # Event-driven: track activity
         if msg_type == "message":
             # L10: iterate active agents only
@@ -1001,6 +1002,7 @@ class Consortium:
                 if line:
                     msg = ConsortiumMessage("Human", line)
                     self.transcript.append(msg)
+                    self.save_transcript()  # Persist every message as it lands
                     self._last_activity = time.time()  # Critical #3: update activity
                     for aid in list(self.active):
                         await self.queues[aid].put(msg)
@@ -1012,12 +1014,19 @@ class Consortium:
                 break
 
     async def run(self):
-        # Register signal handler to clean up status file on SIGTERM/SIGINT
+        # Register signal handler to save partial transcript + clean up status
         def _signal_cleanup(signum, frame):
             self.ending = True
+            try:
+                self.transcript.append(ConsortiumMessage(
+                    "System", f"interrupted by signal {signum}; transcript saved up to this point", "system"))
+                self.save_transcript()
+            except Exception:
+                pass
             self._cleanup_status()
             sys.exit(1)
         signal.signal(signal.SIGTERM, _signal_cleanup)
+        signal.signal(signal.SIGINT, _signal_cleanup)
 
         # Clean up any stale status files from previous crashed consortiums
         self._cleanup_status()
@@ -1354,11 +1363,14 @@ class Consortium:
     def save_transcript(self):
         try:
             now = datetime.now()  # M8: call once
-            ts = now.strftime("%Y%m%d-%H%M%S")
-            slug = re.sub(r'[^a-z0-9]+', '-', self.topic.lower())[:50].strip('-')
-            d = Path.home() / "consortium-transcripts"
-            d.mkdir(exist_ok=True, parents=True)  # M7
-            self.transcript_path = d / f"{ts}-{slug}.md"
+            # Compute the path on first save only; incremental saves must
+            # overwrite the same file rather than scatter timestamped copies.
+            if self.transcript_path is None:
+                ts = now.strftime("%Y%m%d-%H%M%S")
+                slug = re.sub(r'[^a-z0-9]+', '-', self.topic.lower())[:50].strip('-')
+                d = Path.home() / "consortium-transcripts"
+                d.mkdir(exist_ok=True, parents=True)  # M7
+                self.transcript_path = d / f"{ts}-{slug}.md"
 
             now_str = now.strftime('%Y-%m-%d %H:%M:%S')
             start_str = self._start_time.strftime('%Y-%m-%d %H:%M:%S') if self._start_time else now_str  # L2
