@@ -5,9 +5,8 @@ agents:
     command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
     args: ["--yolo"]
     env:
-      LETTA_ACP_BACKEND: remote
+      LETTA_ACP_BACKEND: cloud-oauth
       LETTA_AGENT_ID: agent-b499137a-e1dd-4427-b9df-73e87adfce9e
-      LETTA_APP_SERVER_URL: ws://127.0.0.1:14601
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
 
@@ -18,9 +17,8 @@ agents:
     command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
     args: ["--yolo"]
     env:
-      LETTA_ACP_BACKEND: remote
+      LETTA_ACP_BACKEND: cloud-oauth
       LETTA_AGENT_ID: agent-edc25b5d-5757-4b1f-b533-b8c75f38ba01
-      LETTA_APP_SERVER_URL: ws://127.0.0.1:14602
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
 
@@ -30,9 +28,8 @@ agents:
     command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
     args: ["--yolo"]
     env:
-      LETTA_ACP_BACKEND: remote
+      LETTA_ACP_BACKEND: cloud-oauth
       LETTA_AGENT_ID: agent-e6f1a549-e06c-4510-b8ea-506f0ebbd211
-      LETTA_APP_SERVER_URL: ws://127.0.0.1:14603
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
 
@@ -42,9 +39,8 @@ agents:
     command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
     args: ["--yolo"]
     env:
-      LETTA_ACP_BACKEND: remote
+      LETTA_ACP_BACKEND: cloud-oauth
       LETTA_AGENT_ID: agent-8e405fb7-0bae-4664-86ff-a0b3876b18ce
-      LETTA_APP_SERVER_URL: ws://127.0.0.1:14604
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
 
@@ -54,8 +50,7 @@ agents:
     command: /home/rhomancer/.nvm/versions/node/v22.22.3/bin/letta-acp
     args: ["--yolo"]
     env:
-      LETTA_ACP_BACKEND: remote
+      LETTA_ACP_BACKEND: cloud-oauth
       LETTA_AGENT_ID: agent-5b2254e8-9582-4b39-87be-c9776c958c95
-      LETTA_APP_SERVER_URL: ws://127.0.0.1:14605
       NODE_OPTIONS: "--experimental-websocket"
     cwd: /home/rhomancer
